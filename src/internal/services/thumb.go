@@ -115,7 +115,10 @@ func pickPreviewSize(sizes []tg.PhotoSizeClass) (thumbType string, inline []byte
 // thumbJPEG 拉取消息媒体的缩略图（preview=true 取最大尺寸预览图），
 // 经磁盘缓存返回 JPEG 字节；无可用缩略图（如普通文件）返回空切片。
 func (s *ChatService) thumbJPEG(dialogID int64, dialogType string, messageID int, preview bool) ([]byte, error) {
-	if dialogID == 0 || messageID == 0 {
+	if engine.PeerNamespace(dialogType) == "" {
+		return nil, errors.New("无效对话类型")
+	}
+	if dialogID <= 0 || messageID <= 0 || int64(messageID) > 2147483647 {
 		return nil, errors.New("缺少对话或消息 ID")
 	}
 
@@ -123,7 +126,11 @@ func (s *ChatService) thumbJPEG(dialogID int64, dialogType string, messageID int
 	if preview {
 		kind = cacheKindPreview
 	}
-	return s.thumbs.Get(kind, dialogID, messageID, func() ([]byte, error) {
+	owner := cacheOwner(s.cfg)
+	if s.cfg != nil && owner <= 0 {
+		return nil, errNotLoggedIn
+	}
+	b, err := s.thumbs.Get(cacheMediaKind(kind, dialogType, owner), dialogID, messageID, func() ([]byte, error) {
 		// 独立缩略图队列排队短，worker 会跳过已超时的任务，30s 足够覆盖单次拉取
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
@@ -154,6 +161,10 @@ func (s *ChatService) thumbJPEG(dialogID int64, dialogType string, messageID int
 		}
 		return out, nil
 	})
+	if cacheOwner(s.cfg) != owner {
+		return nil, errors.New("缩略图所属会话已变更")
+	}
+	return b, err
 }
 
 // fetchThumb 从消息媒体定位缩略图并下载；无可用缩略图返回空切片。

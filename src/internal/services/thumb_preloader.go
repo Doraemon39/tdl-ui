@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"os"
 	"sync"
 	"time"
 )
@@ -11,14 +12,14 @@ import (
 type ThumbPreloader struct {
 	chatService *ChatService
 	semaphore   chan struct{} // 控制并发数
-	
+
 	// 预加载统计
 	stats *PreloadStats
 }
 
 // PreloadStats 预加载统计信息
 type PreloadStats struct {
-	mu           sync.RWMutex
+	mu            sync.RWMutex
 	TotalRequests int64
 	SuccessCount  int64
 	FailureCount  int64
@@ -40,6 +41,11 @@ func (p *ThumbPreloader) PreloadThumbs(dialogID int64, dialogType string, messag
 	if len(messageIDs) == 0 {
 		return
 	}
+	if len(messageIDs) > 200 {
+		messageIDs = messageIDs[:200]
+	}
+	messageIDs = append([]int(nil), messageIDs...)
+	owner := cacheOwner(p.chatService.cfg)
 
 	// 在后台 goroutine 中执行预加载
 	go func() {
@@ -48,6 +54,9 @@ func (p *ThumbPreloader) PreloadThumbs(dialogID int64, dialogType string, messag
 
 		var wg sync.WaitGroup
 		for _, msgID := range messageIDs {
+			if cacheOwner(p.chatService.cfg) != owner {
+				return
+			}
 			// 检查上下文是否已取消
 			select {
 			case <-ctx.Done():
@@ -58,7 +67,7 @@ func (p *ThumbPreloader) PreloadThumbs(dialogID int64, dialogType string, messag
 			wg.Add(1)
 			go func(messageID int) {
 				defer wg.Done()
-				
+
 				// 获取信号量，控制并发数
 				select {
 				case p.semaphore <- struct{}{}:
@@ -115,11 +124,8 @@ func (p *ThumbPreloader) preloadSingleThumb(ctx context.Context, dialogID int64,
 
 	// 检查是否已缓存（快速路径）
 	kind := cacheKindThumb
-	cachePath := p.chatService.thumbs.path(kind, dialogID, messageID)
-	if _, err := p.chatService.thumbs.Get(kind, dialogID, messageID, func() ([]byte, error) {
-		// 如果缓存存在，这个 fetch 函数不会被调用
-		return nil, nil
-	}); err == nil {
+	cachePath := p.chatService.thumbs.path(cacheMediaKind(kind, dialogType, cacheOwner(p.chatService.cfg)), dialogID, messageID)
+	if st, err := os.Stat(cachePath); err == nil && st.Mode().IsRegular() && st.Size() > 0 {
 		// 缓存命中
 		p.stats.mu.Lock()
 		p.stats.CacheHits++
@@ -130,7 +136,7 @@ func (p *ThumbPreloader) preloadSingleThumb(ctx context.Context, dialogID int64,
 
 	// 执行预加载
 	_, err := p.chatService.thumbJPEG(dialogID, dialogType, messageID, false)
-	
+
 	p.stats.mu.Lock()
 	if err != nil {
 		p.stats.FailureCount++

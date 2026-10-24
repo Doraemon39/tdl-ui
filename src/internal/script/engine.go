@@ -11,9 +11,16 @@
 package script
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"io"
+	"io/fs"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -29,6 +36,7 @@ var logScript = logging.L("script")
 
 // callTimeout 单次脚本函数调用的超时时间；var 便于测试缩短。
 var callTimeout = 10 * time.Second
+var loadTimeout = 10 * time.Second
 
 // errScriptTimeout 脚本执行超时哨兵错误，用于触发契约函数熔断。
 var errScriptTimeout = errors.New("脚本执行超时")
@@ -43,6 +51,9 @@ func fuseContract(name string) {
 
 // Contracts 从脚本中解析出的契约函数集合，未定义的函数为 nil。
 type Contracts struct {
+	interpreter *interp.Interpreter
+	callFile    scriptapi.FileInfo
+	callTask    scriptapi.TaskInfo
 	Filter      func(scriptapi.FileInfo) bool
 	Rename      func(scriptapi.FileInfo) string
 	OnTaskStart func(scriptapi.TaskInfo)
@@ -60,7 +71,30 @@ type Contracts struct {
 
 // Load 解释执行脚本源码并提取契约函数。
 func Load(src string) (*Contracts, error) {
-	i := interp.New(interp.Options{})
+	if len(src) > 1<<20 {
+		return nil, errors.New("脚本超过 1 MiB 上限")
+	}
+	parsed, err := parser.ParseFile(token.NewFileSet(), "script.go", src, 0)
+	if err != nil {
+		return nil, fmt.Errorf("脚本编译失败: %w", err)
+	}
+	for _, spec := range parsed.Imports {
+		name, err := strconv.Unquote(spec.Path.Value)
+		if err != nil || !allowedImport(name) {
+			return nil, fmt.Errorf("脚本不允许导入 %s", spec.Path.Value)
+		}
+	}
+	background := false
+	ast.Inspect(parsed, func(n ast.Node) bool {
+		if _, ok := n.(*ast.GoStmt); ok {
+			background = true
+		}
+		return true
+	})
+	if background {
+		return nil, errors.New("脚本不允许启动后台 goroutine")
+	}
+	i := interp.New(interp.Options{SourcecodeFilesystem: emptySourceFS{}, Stdin: strings.NewReader(""), Stdout: io.Discard, Stderr: io.Discard, Args: []string{}, Env: []string{}})
 	if err := i.Use(sandboxSymbols()); err != nil {
 		return nil, fmt.Errorf("load stdlib: %w", err)
 	}
@@ -68,11 +102,19 @@ func Load(src string) (*Contracts, error) {
 		return nil, fmt.Errorf("load tdlui/api: %w", err)
 	}
 
-	if _, err := i.Eval(src); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), loadTimeout)
+	defer cancel()
+	if _, err := i.EvalWithContext(ctx, src); err != nil {
 		return nil, fmt.Errorf("脚本编译失败: %w", err)
 	}
 
-	c := &Contracts{}
+	c := &Contracts{interpreter: i}
+	if err := i.Use(interp.Exports{"tdlui/invoke/invoke": {"File": reflect.ValueOf(func() scriptapi.FileInfo { return c.callFile }), "Task": reflect.ValueOf(func() scriptapi.TaskInfo { return c.callTask })}}); err != nil {
+		return nil, err
+	}
+	if _, err := i.Eval(`import __tdlInvoke "tdlui/invoke"`); err != nil {
+		return nil, err
+	}
 	if v, err := i.Eval("main.Filter"); err == nil {
 		fn, ok := v.Interface().(func(scriptapi.FileInfo) bool)
 		if !ok {
@@ -146,6 +188,14 @@ func (c *Contracts) SafeFilter(f scriptapi.FileInfo) (keep bool, err error) {
 	if c.Filter == nil {
 		return true, nil
 	}
+	if c.interpreter != nil {
+		c.callFile = f
+		v, e := c.invoke("main.Filter(__tdlInvoke.File())")
+		if e != nil {
+			return true, e
+		}
+		return v.Bool(), nil
+	}
 	keep, err = callWithGuard(func() bool { return c.Filter(f) }, true)
 	if errors.Is(err, errScriptTimeout) {
 		c.Filter = nil
@@ -163,6 +213,14 @@ func (c *Contracts) SafeRename(f scriptapi.FileInfo) (name string, err error) {
 	defer c.mu.Unlock()
 	if c.Rename == nil {
 		return "", nil
+	}
+	if c.interpreter != nil {
+		c.callFile = f
+		v, e := c.invoke("main.Rename(__tdlInvoke.File())")
+		if e != nil {
+			return "", e
+		}
+		return v.String(), nil
 	}
 	name, err = callWithGuard(func() string { return c.Rename(f) }, "")
 	if errors.Is(err, errScriptTimeout) {
@@ -182,6 +240,11 @@ func (c *Contracts) SafeOnTaskStart(t scriptapi.TaskInfo) error {
 	if c.OnTaskStart == nil {
 		return nil
 	}
+	if c.interpreter != nil {
+		c.callTask = t
+		_, e := c.invoke("main.OnTaskStart(__tdlInvoke.Task())")
+		return e
+	}
 	_, err := callWithGuard(func() struct{} { c.OnTaskStart(t); return struct{}{} }, struct{}{})
 	if errors.Is(err, errScriptTimeout) {
 		c.OnTaskStart = nil
@@ -200,6 +263,11 @@ func (c *Contracts) SafeOnFileDone(f scriptapi.FileInfo) error {
 	if c.OnFileDone == nil {
 		return nil
 	}
+	if c.interpreter != nil {
+		c.callFile = f
+		_, e := c.invoke("main.OnFileDone(__tdlInvoke.File())")
+		return e
+	}
 	_, err := callWithGuard(func() struct{} { c.OnFileDone(f); return struct{}{} }, struct{}{})
 	if errors.Is(err, errScriptTimeout) {
 		c.OnFileDone = nil
@@ -217,6 +285,11 @@ func (c *Contracts) SafeOnTaskDone(t scriptapi.TaskInfo) error {
 	defer c.mu.Unlock()
 	if c.OnTaskDone == nil {
 		return nil
+	}
+	if c.interpreter != nil {
+		c.callTask = t
+		_, e := c.invoke("main.OnTaskDone(__tdlInvoke.Task())")
+		return e
 	}
 	_, err := callWithGuard(func() struct{} { c.OnTaskDone(t); return struct{}{} }, struct{}{})
 	if errors.Is(err, errScriptTimeout) {
@@ -282,10 +355,55 @@ func sandboxSymbols() interp.Exports {
 			importPath = key[:idx]
 		}
 		if _, ok := allowed[importPath]; ok {
-			symbols[key] = pkg
+			copyPkg := make(map[string]reflect.Value, len(pkg))
+			for name, value := range pkg {
+				copyPkg[name] = value
+			}
+			if importPath == "path/filepath" {
+				for _, name := range []string{"Abs", "Glob", "Walk", "WalkDir", "EvalSymlinks"} {
+					delete(copyPkg, name)
+				}
+			}
+			if importPath == "time" {
+				for _, name := range []string{"Sleep", "After", "AfterFunc", "Tick", "NewTimer", "NewTicker", "LoadLocation"} {
+					delete(copyPkg, name)
+				}
+			}
+			symbols[key] = copyPkg
 		}
 	}
 	return symbols
+}
+
+type emptySourceFS struct{}
+
+func (emptySourceFS) Open(name string) (fs.File, error) {
+	return nil, &fs.PathError{Op: "open", Path: name, Err: fs.ErrNotExist}
+}
+func allowedImport(name string) bool {
+	switch name {
+	case "tdlui/api", "bytes", "errors", "fmt", "math", "math/rand", "path", "path/filepath", "regexp", "sort", "strconv", "strings", "time", "unicode", "unicode/utf8":
+		return true
+	}
+	return false
+}
+
+// Called with c.mu held. A timed-out interpreter is retired completely; no
+// later hook shares state with its canceled execution frames.
+func (c *Contracts) invoke(expression string) (reflect.Value, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), callTimeout)
+	defer cancel()
+	v, err := c.interpreter.EvalWithContext(ctx, expression)
+	if errors.Is(err, context.DeadlineExceeded) {
+		scriptapi.Logf("[熔断] 脚本执行超过 %s，已取消执行并禁用此脚本的全部契约函数", callTimeout)
+		c.Filter = nil
+		c.Rename = nil
+		c.OnTaskStart = nil
+		c.OnFileDone = nil
+		c.OnTaskDone = nil
+		return reflect.Value{}, errScriptTimeout
+	}
+	return v, err
 }
 
 // apiExports 注入自定义符号包 tdlui/api。

@@ -56,21 +56,17 @@ func ensureWritableDir(dir string) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	probe := filepath.Join(dir, ".tdl-ui-write-test")
-	if err := os.WriteFile(probe, []byte("ok"), 0o644); err != nil {
+	probe, err := os.CreateTemp(dir, ".tdl-ui-write-test-*")
+	if err != nil {
 		return err
 	}
-	_ = os.Remove(probe)
-	return nil
-}
-
-// fallbackLogDir 默认目录不可写时的回退位置：用户缓存目录（Windows 为 %LOCALAPPDATA%）。
-func fallbackLogDir() string {
-	base, err := os.UserCacheDir()
-	if err != nil {
-		return ""
+	name := probe.Name()
+	closeErr := probe.Close()
+	removeErr := os.Remove(name)
+	if closeErr != nil {
+		return closeErr
 	}
-	return filepath.Join(base, "tdl-ui", "logs")
+	return removeErr
 }
 
 // WithDefaults 缺省/非法字段回填默认值，返回规范化副本。
@@ -109,10 +105,13 @@ func (s LogSettings) fileEnabled() bool { return s.Targets == "file" || s.Target
 func (s LogSettings) uiEnabled() bool   { return s.Targets == "ui" || s.Targets == "both" }
 
 // ParseYAML 解析 YAML 配置，缺省字段用默认值补齐。
-func ParseYAML(b []byte) (LogSettings, error) {
+func ParseYAML(b []byte, defaultDirs ...string) (LogSettings, error) {
 	var s LogSettings
 	if err := yaml.Unmarshal(b, &s); err != nil {
 		return LogSettings{}, err
+	}
+	if s.Dir == "" && len(defaultDirs) > 0 {
+		s.Dir = defaultDirs[0]
 	}
 	return s.WithDefaults(), nil
 }

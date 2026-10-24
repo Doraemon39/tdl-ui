@@ -21,7 +21,7 @@ src/
 ├── wails.json           # Wails 项目配置（pnpm 命令）
 ├── go.mod               # module tdl-ui；replace 指向 ../ref/tdl
 ├── internal/
-│   ├── config/          # 设置持久化（%AppData%\tdl-ui\config.yaml）
+│   ├── config/          # 设置持久化（<DataDir>/config.yaml）
 │   ├── events/          # 事件名常量与 Emitter（Wails EventsEmit 封装）
 │   ├── scriptapi/       # 脚本可见类型：FileInfo / TaskInfo / Log
 │   ├── script/          # Yaegi 引擎封装 + 脚本文件 CRUD + 内置模板（templates/）

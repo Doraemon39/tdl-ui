@@ -47,6 +47,19 @@ func TestSinkFormat(t *testing.T) {
 	}
 }
 
+func TestProxyCredentialsNeverEnterLogs(t *testing.T) {
+	s := newSink(zap.NewAtomicLevelAt(zapcore.DebugLevel))
+	defer s.close()
+	s.settings.Targets = "ui"
+	if err := s.Write(testEntry("proxy failed: socks5://alice:secret@127.0.0.1:1080"), nil); err != nil {
+		t.Fatal(err)
+	}
+	entry := s.recent()[0]
+	if strings.Contains(entry.Msg, "secret") || strings.Contains(entry.Text, "alice") {
+		t.Fatal("proxy credentials leaked")
+	}
+}
+
 func TestFormatEntryCustomTemplate(t *testing.T) {
 	e := LogEntry{Time: "T", Level: "WARN", Module: "m", File: "f.go", Func: "fn", Line: 7, Msg: "hello"}
 	got := formatEntry("{level}|{module}|{line}|{msg}", e)

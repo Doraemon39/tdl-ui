@@ -2,6 +2,7 @@ package services
 
 import (
 	"context"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -11,12 +12,12 @@ import (
 type SmartCacheWarmer struct {
 	chatService *ChatService
 	tieredCache *TieredCache
-	
+
 	// 用户行为跟踪
 	mu            sync.RWMutex
-	recentDialogs []int64                    // 最近访问的对话列表
-	accessPattern map[string]*AccessPattern  // 访问模式统计
-	
+	recentDialogs []int64                   // 最近访问的对话列表
+	accessPattern map[string]*AccessPattern // 访问模式统计
+
 	// 配置
 	maxRecentDialogs int
 	preloadEnabled   bool
@@ -24,11 +25,11 @@ type SmartCacheWarmer struct {
 
 // AccessPattern 访问模式统计
 type AccessPattern struct {
-	DialogID     int64
-	AccessCount  int64
-	LastAccess   time.Time
-	CommonKinds  map[string]int // 媒体类型访问频率
-	TimePattern  []int          // 访问时间模式（小时）
+	DialogID    int64
+	AccessCount int64
+	LastAccess  time.Time
+	CommonKinds map[string]int // 媒体类型访问频率
+	TimePattern []int          // 访问时间模式（小时）
 }
 
 // NewSmartCacheWarmer 创建智能缓存预热器
@@ -45,19 +46,19 @@ func NewSmartCacheWarmer(chatService *ChatService, tieredCache *TieredCache) *Sm
 
 // WarmupForDialog 为指定对话预热缓存
 func (w *SmartCacheWarmer) WarmupForDialog(dialogID int64, dialogType string, visibleItems []MediaItem) {
-	if !w.preloadEnabled {
+	if !w.IsPreloadEnabled() {
 		return
 	}
-	
+
 	// 记录访问行为
 	w.recordDialogAccess(dialogID, visibleItems)
-	
+
 	// 预加载当前可见区域的缩略图
 	go w.preloadVisibleThumbs(dialogID, dialogType, visibleItems)
-	
+
 	// 基于访问模式预测性预加载
 	go w.predictivePreload(dialogID, dialogType)
-	
+
 	// 预加载相关对话
 	go w.preloadRelatedDialogs(dialogID)
 }
@@ -66,10 +67,10 @@ func (w *SmartCacheWarmer) WarmupForDialog(dialogID int64, dialogType string, vi
 func (w *SmartCacheWarmer) recordDialogAccess(dialogID int64, items []MediaItem) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	
+
 	// 更新最近访问对话列表
 	w.updateRecentDialogs(dialogID)
-	
+
 	// 更新访问模式
 	key := w.getDialogKey(dialogID)
 	pattern, exists := w.accessPattern[key]
@@ -81,15 +82,15 @@ func (w *SmartCacheWarmer) recordDialogAccess(dialogID int64, items []MediaItem)
 		}
 		w.accessPattern[key] = pattern
 	}
-	
+
 	pattern.AccessCount++
 	pattern.LastAccess = time.Now()
-	
+
 	// 统计媒体类型偏好
 	for _, item := range items {
 		pattern.CommonKinds[item.Kind]++
 	}
-	
+
 	// 记录访问时间模式
 	hour := time.Now().Hour()
 	pattern.TimePattern[hour]++
@@ -104,10 +105,10 @@ func (w *SmartCacheWarmer) updateRecentDialogs(dialogID int64) {
 			break
 		}
 	}
-	
+
 	// 添加到最前面
 	w.recentDialogs = append([]int64{dialogID}, w.recentDialogs...)
-	
+
 	// 限制列表长度
 	if len(w.recentDialogs) > w.maxRecentDialogs {
 		w.recentDialogs = w.recentDialogs[:w.maxRecentDialogs]
@@ -119,35 +120,35 @@ func (w *SmartCacheWarmer) preloadVisibleThumbs(dialogID int64, dialogType strin
 	if w.chatService.thumbPreloader == nil {
 		return
 	}
-	
+
 	// 预加载前 20 个可见项的缩略图
 	endIdx := len(items)
 	if endIdx > 20 {
 		endIdx = 20
 	}
-	
+
 	w.chatService.thumbPreloader.PreloadVisibleThumbs(dialogID, dialogType, items, 0, endIdx-1)
 }
 
 // predictivePreload 预测性预加载
 func (w *SmartCacheWarmer) predictivePreload(dialogID int64, dialogType string) {
 	w.mu.RLock()
-	pattern, exists := w.accessPattern[w.getDialogKey(dialogID)]
+	pattern := clonePattern(w.accessPattern[w.getDialogKey(dialogID)])
 	w.mu.RUnlock()
-	
-	if !exists || pattern.AccessCount < 3 {
+
+	if pattern == nil || pattern.AccessCount < 3 {
 		// 访问次数太少，无法进行有效预测
 		return
 	}
-	
+
 	// 基于用户偏好的媒体类型进行预测性预加载
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		
+
 		// 获取用户最常访问的媒体类型
 		preferredKind := w.getPreferredMediaKind(pattern)
-		
+
 		// 构建查询条件
 		query := MediaQuery{
 			DialogID:   dialogID,
@@ -155,13 +156,13 @@ func (w *SmartCacheWarmer) predictivePreload(dialogID int64, dialogType string) 
 			Limit:      50, // 预加载50个媒体项
 			Kinds:      []string{preferredKind},
 		}
-		
+
 		// 异步查询并预加载
 		page, err := w.chatService.ListMedia(query)
 		if err != nil || page == nil {
 			return
 		}
-		
+
 		// 预加载这些媒体的缩略图
 		var messageIDs []int
 		for _, item := range page.Items {
@@ -169,11 +170,11 @@ func (w *SmartCacheWarmer) predictivePreload(dialogID int64, dialogType string) 
 				messageIDs = append(messageIDs, item.MessageID)
 			}
 		}
-		
+
 		if len(messageIDs) > 0 && w.chatService.thumbPreloader != nil {
 			w.chatService.thumbPreloader.PreloadThumbs(dialogID, dialogType, messageIDs)
 		}
-		
+
 		_ = ctx // 避免未使用变量警告
 	}()
 }
@@ -182,7 +183,7 @@ func (w *SmartCacheWarmer) predictivePreload(dialogID int64, dialogType string) 
 func (w *SmartCacheWarmer) preloadRelatedDialogs(currentDialogID int64) {
 	w.mu.RLock()
 	relatedDialogs := make([]int64, 0, 3)
-	
+
 	// 选择最近访问的其他对话
 	for _, dialogID := range w.recentDialogs {
 		if dialogID != currentDialogID && len(relatedDialogs) < 3 {
@@ -190,7 +191,7 @@ func (w *SmartCacheWarmer) preloadRelatedDialogs(currentDialogID int64) {
 		}
 	}
 	w.mu.RUnlock()
-	
+
 	// 为相关对话预加载少量媒体
 	for _, dialogID := range relatedDialogs {
 		go func(id int64) {
@@ -204,27 +205,40 @@ func (w *SmartCacheWarmer) preloadRelatedDialogs(currentDialogID int64) {
 func (w *SmartCacheWarmer) getPreferredMediaKind(pattern *AccessPattern) string {
 	maxCount := 0
 	preferredKind := KindPhoto // 默认偏好图片
-	
+
 	for kind, count := range pattern.CommonKinds {
 		if count > maxCount {
 			maxCount = count
 			preferredKind = kind
 		}
 	}
-	
+
 	return preferredKind
 }
 
 // getDialogKey 获取对话键
 func (w *SmartCacheWarmer) getDialogKey(dialogID int64) string {
-	return string(rune(dialogID))
+	return strconv.FormatInt(dialogID, 10)
 }
 
 // GetAccessPattern 获取访问模式统计
 func (w *SmartCacheWarmer) GetAccessPattern(dialogID int64) *AccessPattern {
 	w.mu.RLock()
 	defer w.mu.RUnlock()
-	return w.accessPattern[w.getDialogKey(dialogID)]
+	return clonePattern(w.accessPattern[w.getDialogKey(dialogID)])
+}
+
+func clonePattern(p *AccessPattern) *AccessPattern {
+	if p == nil {
+		return nil
+	}
+	copyP := *p
+	copyP.CommonKinds = map[string]int{}
+	for k, v := range p.CommonKinds {
+		copyP.CommonKinds[k] = v
+	}
+	copyP.TimePattern = append([]int(nil), p.TimePattern...)
+	return &copyP
 }
 
 // GetRecentDialogs 获取最近访问的对话列表

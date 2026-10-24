@@ -31,7 +31,8 @@ interface Snapshot {
 }
 
 // 模块级 LRU：跨组件卸载保留最近浏览对话的媒体状态
-const cache = new Map<number, Snapshot>()
+const cache = new Map<string, Snapshot>()
+export function clearMediaSnapshots() { cache.clear() }
 const CACHE_LIMIT = 5
 
 const PAGE_SIZE = 50
@@ -41,6 +42,8 @@ const MAX_EMPTY_PAGES = 3
 export function useMediaPager(options: {
   /** 当前对话类型（查询参数用，切换后由调用方保证与 switchTo 的 id 匹配） */
   dialogType: () => string
+  accountId?: () => number
+  ready?: () => boolean
   /** 加载失败回调（toast 等由调用方决定） */
   onError?: (e: unknown) => void
   /** 一轮加载结束后是否自动继续（如滚动哨兵仍在视口内） */
@@ -57,12 +60,18 @@ export function useMediaPager(options: {
   const jumpOffsetDate = ref(0)
   const restoredScrollTop = ref(0)
 
+  const scanning = ref(false)
+  const scannedCount = ref(0)
+  let currentKey = ''
+  let currentOwner: number | undefined
   let currentId = 0
   // 请求代际：每次重置/切换递增，在途请求返回后校验不等则丢弃
   let epoch = 0
 
   function resetState() {
     epoch++
+    scanning.value = false
+    scannedCount.value = 0
     items.value = []
     offset.value = 0
     hasMore.value = true
@@ -74,9 +83,9 @@ export function useMediaPager(options: {
 
   /** 保存当前对话的浏览快照（切换对话或组件卸载时调用） */
   function saveSnapshot() {
-    if (!currentId || !items.value.length) return
-    cache.delete(currentId)
-    cache.set(currentId, {
+    if (!currentKey || currentOwner !== options.accountId?.() || !items.value.length || items.value.length > 2000) return
+    cache.delete(currentKey)
+    cache.set(currentKey, {
       items: [...items.value],
       offset: offset.value,
       hasMore: hasMore.value,
@@ -93,17 +102,20 @@ export function useMediaPager(options: {
   function switchTo(dialogId: number | null): boolean {
     saveSnapshot()
     currentId = dialogId ?? 0
-    const snap = dialogId ? cache.get(dialogId) : undefined
+    currentOwner = options.accountId?.()
+    currentKey = dialogId ? `${currentOwner ?? 0}:${options.dialogType()}:${dialogId}` : ''
+    const snap = cache.get(currentKey)
     if (snap && dialogId) {
       // LRU touch
-      cache.delete(dialogId)
-      cache.set(dialogId, snap)
+      cache.delete(currentKey)
+      cache.set(currentKey, snap)
       epoch++
       items.value = [...snap.items]
       offset.value = snap.offset
       hasMore.value = snap.hasMore
       applied.value = { ...snap.applied, kinds: [...snap.applied.kinds], exts: [...snap.applied.exts] }
       jumpOffsetDate.value = snap.jumpOffsetDate
+      scanning.value = false
       loading.value = false
       failed.value = false
       restoredScrollTop.value = snap.scrollTop
@@ -116,7 +128,7 @@ export function useMediaPager(options: {
 
   /** 应用筛选条件并重新拉取（保持当前对话） */
   function applyFilters(f: AppliedFilters) {
-    applied.value = f
+    applied.value = { ...f, kinds: [...f.kinds], exts: [...f.exts] }
     resetState()
     void loadMore()
   }
@@ -143,9 +155,13 @@ export function useMediaPager(options: {
     }
   }
 
+  function contextReady() {
+    return (options.ready?.() ?? true) && ['private','group','supergroup','channel'].includes(options.dialogType())
+  }
   async function loadMore() {
-    if (loading.value || !hasMore.value || !currentId) return
+    if (!contextReady() || loading.value || scanning.value || !hasMore.value || !currentId) return
     const myEpoch = epoch
+    const owner = options.accountId?.()
     // 固定本轮查询的对话快照，避免循环中途切换对话混入两个对话的查询
     const dialogId = currentId
     const dialogType = options.dialogType()
@@ -156,8 +172,9 @@ export function useMediaPager(options: {
       let emptyPages = 0
       for (;;) {
         const page = await Chat.listMedia(buildQuery(dialogId, dialogType))
-        if (myEpoch !== epoch) return // 代际已作废：丢弃过期响应
-        items.value.push(...(page.items ?? []))
+        if (myEpoch !== epoch || owner !== options.accountId?.()) return // 代际已作废：丢弃过期响应
+        checkCursor(offset.value, page.nextOffset)
+        mergePage(page.items ?? [])
         offset.value = page.nextOffset
         hasMore.value = page.nextOffset !== 0
 
@@ -166,21 +183,83 @@ export function useMediaPager(options: {
         }
       }
     } catch (e) {
-      if (myEpoch !== epoch) return
+      if (myEpoch !== epoch || owner !== options.accountId?.()) return
       failed.value = true
       options.onError?.(e)
     } finally {
-      if (myEpoch === epoch) {
+      if (myEpoch === epoch && owner === options.accountId?.()) {
         loading.value = false
         // 哨兵仍在视口内（如首屏未铺满）则继续拉取
         if (options.autoContinue?.() && hasMore.value && !failed.value) {
-          setTimeout(() => loadMore(), 0)
+          setTimeout(() => { if (myEpoch === epoch) void loadMore() }, 0)
         }
       }
     }
   }
 
+  function checkCursor(previous: number, next: number) {
+    if (!Number.isSafeInteger(next) || next < 0 || (next > 0 && previous > 0 && next >= previous)) {
+      throw new Error('媒体分页游标未前进，扫描已停止，请刷新后重试')
+    }
+  }
+
+  function mergePage(page: MediaItem[]) {
+    const seen = new Set(items.value.map(item => item.messageId))
+    for (const item of page) {
+      if (item.dialogId !== currentId) throw new Error('媒体响应不属于当前对话')
+      if (!seen.has(item.messageId)) { seen.add(item.messageId); items.value.push(item) }
+    }
+  }
+
+  function cancelScan() {
+    epoch++
+    scanning.value = false
+    loading.value = false
+  }
+
+  /** Scan matching media from the latest message. Only complete results may
+   * trigger the automatic download dialog; cancellation keeps loaded media. */
+  async function loadAll(unfiltered = false): Promise<{ status: 'complete' | 'cancelled' | 'failed' | 'limit'; items: MediaItem[] }> {
+    if (!contextReady() || scanning.value || !currentId) return { status: 'cancelled', items: [] }
+    if (unfiltered) { resetState(); applied.value = emptyFilters() }
+    else if (jumpOffsetDate.value > 0) resetState()
+    const myEpoch = ++epoch
+    const dialogId = currentId
+    const dialogType = options.dialogType()
+    const owner = options.accountId?.()
+    const valid = () => myEpoch === epoch && currentId === dialogId && owner === options.accountId?.() && dialogType === options.dialogType() && contextReady()
+    scanning.value = true
+    loading.value = true
+    failed.value = false
+    scannedCount.value = items.value.length
+    try {
+      while (hasMore.value) {
+        const query = { ...buildQuery(dialogId, dialogType), limit: 100 }
+        const page = await Chat.listMedia(query)
+        if (!valid()) return { status: 'cancelled', items: [] }
+        checkCursor(offset.value, page.nextOffset)
+        mergePage(page.items ?? [])
+        offset.value = page.nextOffset
+        hasMore.value = page.nextOffset !== 0
+        scannedCount.value = items.value.length
+        // Keep the UI responsive and bound memory for exceptionally large chats.
+        if (items.value.length >= 100000 && hasMore.value) return { status: 'limit', items: [] }
+        if (hasMore.value) await new Promise(resolve => setTimeout(resolve, 150))
+        if (!valid()) return { status: 'cancelled', items: [] }
+      }
+      return { status: 'complete', items: [...items.value] }
+    } catch (e) {
+      if (!valid()) return { status: 'cancelled', items: [] }
+      failed.value = true
+      options.onError?.(e)
+      return { status: 'failed', items: [] }
+    } finally {
+      if (myEpoch === epoch) { scanning.value = false; loading.value = false }
+    }
+  }
+
   return {
+    loadAll, cancelScan, scanning, scannedCount,
     items,
     offset,
     hasMore,

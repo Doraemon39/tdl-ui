@@ -2,6 +2,9 @@ package engine
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,18 +15,25 @@ import (
 	"github.com/go-faster/errors"
 
 	"github.com/iyear/tdl/core/downloader"
-	"github.com/iyear/tdl/core/util/fsutil"
+	"tdl-ui/internal/manifest"
 )
 
 // FileEvent 文件级进度事件负载（task:file）。
 type FileEvent struct {
-	TaskID     string `json:"taskId"`
-	FileID     int    `json:"fileId"`
-	DialogID   int64  `json:"dialogId"`
-	MessageID  int    `json:"messageId"`
-	Name       string `json:"name"`
-	Total      int64  `json:"total"`
-	Downloaded int64  `json:"downloaded"`
+	Date          int64  `json:"date,omitempty"`
+	OriginalName  string `json:"originalName,omitempty"`
+	MediaID       string `json:"mediaId,omitempty"`
+	ManifestPath  string `json:"manifestPath,omitempty"`
+	ManifestError string `json:"manifestError,omitempty"`
+	AccountID     int64  `json:"accountId,omitempty"`
+	DialogType    string `json:"dialogType,omitempty"`
+	TaskID        string `json:"taskId"`
+	FileID        int    `json:"fileId"`
+	DialogID      int64  `json:"dialogId"`
+	MessageID     int    `json:"messageId"`
+	Name          string `json:"name"`
+	Total         int64  `json:"total"`
+	Downloaded    int64  `json:"downloaded"`
 	// State: downloading / done / failed
 	State string `json:"state"`
 	Error string `json:"error,omitempty"`
@@ -72,12 +82,13 @@ func newProgress(task *Task, it *iter, rewriteExt bool, emitInterval time.Durati
 func (p *progress) OnAdd(elem downloader.Elem) {
 	e := elem.(*iterElem)
 	p.task.addFile(TaskFile{
-		Name:      strings.TrimSuffix(filepath.Base(e.to.Name()), tempExt),
-		Path:      e.to.Name(),
-		Size:      e.file.Size,
-		State:     "downloading",
-		DialogID:  e.info.DialogID,
-		MessageID: e.info.MessageID,
+		Name:         e.targetName,
+		Path:         e.to.Name(),
+		Size:         e.file.Size,
+		State:        "downloading",
+		DialogID:     e.info.DialogID,
+		MessageID:    e.info.MessageID,
+		OriginalName: e.info.FileName, DialogType: peerDialogType(e.from), MediaID: MediaIdentity(e.fromMsg),
 	})
 	p.emit(e, e.file.Size, 0, "downloading", nil)
 }
@@ -103,6 +114,26 @@ func (p *progress) OnDownload(elem downloader.Elem, state downloader.ProgressSta
 func (p *progress) OnDone(elem downloader.Elem, err error) {
 	e := elem.(*iterElem)
 	tmpPath := e.to.Name()
+	digest := ""
+	defer p.it.release(e.targetName)
+	if err == nil {
+		stat, statErr := e.to.Stat()
+		if statErr != nil {
+			err = errors.Wrap(statErr, "verify downloaded file")
+		} else if e.file.Size > 0 && stat.Size() != e.file.Size {
+			err = errors.Errorf("文件长度不匹配：预期 %d 字节，实际 %d 字节", e.file.Size, stat.Size())
+		} else if syncErr := e.to.Sync(); syncErr != nil {
+			err = errors.Wrap(syncErr, "flush downloaded file")
+		}
+	}
+	if err == nil {
+		h := sha256.New()
+		if _, hashErr := io.Copy(h, io.NewSectionReader(e.to, 0, e.file.Size)); hashErr != nil {
+			err = hashErr
+		} else {
+			digest = hex.EncodeToString(h.Sum(nil))
+		}
+	}
 
 	if cerr := e.to.Close(); cerr != nil {
 		p.fail(e, errors.Wrap(cerr, "close file"))
@@ -113,32 +144,60 @@ func (p *progress) OnDone(elem downloader.Elem, err error) {
 		if !errors.Is(err, context.Canceled) { // 用户取消不算失败
 			p.fail(e, err)
 		}
-		_ = os.Remove(tmpPath) // 尽力清理临时文件
-		p.task.dropFile(tmpPath)
+		_ = os.Remove(tmpPath)
+		if errors.Is(err, context.Canceled) {
+			p.task.dropFile(tmpPath)
+		}
 		return
 	}
 
-	p.it.Finish(e.resumeKey)
-	p.task.saveResumeKey(e.resumeKey) // 实时持久化断点（内容坐标，行级追加）
-
 	newpath, perr := p.donePost(e)
+	if errors.Is(perr, errOutputSkipped) {
+		_ = os.Remove(tmpPath)
+		p.task.dropFile(tmpPath)
+		p.task.onFileSkipped(TaskFile{Name: e.targetName, Size: e.file.Size, State: "skipped", Reason: perr.Error(), DialogID: e.info.DialogID, MessageID: e.info.MessageID, DialogType: peerDialogType(e.from), OriginalName: e.info.FileName})
+		p.clearSpeedSample(e.id)
+		p.emit(e, e.file.Size, 0, "skipped", nil)
+		return
+	}
 	if perr != nil {
 		p.fail(e, errors.Wrap(perr, "post file"))
 		return
 	}
 	p.task.finishFile(tmpPath, TaskFile{
-		Name:      filepath.Base(newpath),
-		Path:      newpath,
-		Size:      e.file.Size,
-		State:     "done",
-		DialogID:  e.info.DialogID,
-		MessageID: e.info.MessageID,
+		SHA256:       digest,
+		Name:         filepath.Base(newpath),
+		Path:         newpath,
+		Size:         e.file.Size,
+		State:        "done",
+		DialogID:     e.info.DialogID,
+		MessageID:    e.info.MessageID,
+		OriginalName: e.info.FileName, DialogType: peerDialogType(e.from), MediaID: MediaIdentity(e.fromMsg),
 	})
 
+	p.it.Finish(e.resumeKey)
+	p.task.saveResumeKey(e.resumeKey)
+	manifestError := ""
+	if p.task.opts.RecordManifest && p.task.manifest != nil && p.task.manifest.MatchesSource(e.info.DialogID, peerDialogType(e.from)) {
+		duplicates := p.it.duplicateCounts[e.info.FileName]
+		if duplicates < 2 {
+			duplicates = 0
+		}
+		if err := p.task.manifest.MarkDone(manifest.Entry{SHA256: digest, MessageID: e.info.MessageID, MediaID: MediaIdentity(e.fromMsg), Name: e.info.FileName, Size: e.file.Size, Date: e.info.MessageDate, SavedName: filepath.Base(newpath), DuplicateCount: duplicates}); err != nil {
+			manifestError = err.Error()
+			p.task.mu.Lock()
+			p.task.manifestError = manifestError
+			p.task.mu.Unlock()
+		}
+	}
 	p.task.onFileDone(e.info)
 	ev := p.buildEvent(e, e.file.Size, e.file.Size, "done", nil)
 	ev.Name = filepath.Base(newpath) // rewriteExt 可能改名，以最终文件名为准
 	ev.Path = newpath
+	if p.task.opts.RecordManifest {
+		ev.ManifestPath = p.task.opts.ManifestPath
+		ev.ManifestError = manifestError
+	}
 	ev.Speed = 0
 	p.clearSpeedSample(e.id)
 	p.task.emitFile(ev)
@@ -146,7 +205,10 @@ func (p *progress) OnDone(elem downloader.Elem, err error) {
 
 // donePost 去除 .tmp 后缀、可选按 MIME 重写扩展名、还原消息时间；返回最终路径。
 func (p *progress) donePost(e *iterElem) (string, error) {
-	newfile := strings.TrimSuffix(filepath.Base(e.to.Name()), tempExt)
+	newfile := e.targetName
+	if newfile == "" {
+		newfile = strings.TrimSuffix(filepath.Base(e.to.Name()), tempExt)
+	}
 
 	if p.rewriteExt {
 		mime, err := mimetype.DetectFile(e.to.Name())
@@ -154,20 +216,25 @@ func (p *progress) donePost(e *iterElem) (string, error) {
 			return "", errors.Wrap(err, "detect mime")
 		}
 		if ext := mime.Extension(); ext != "" && filepath.Ext(newfile) != ext {
-			newfile = fsutil.GetNameWithoutExt(newfile) + ext
+			newfile = strings.TrimSuffix(newfile, filepath.Ext(newfile)) + ext
 		}
 	}
 
-	newpath := filepath.Join(filepath.Dir(e.to.Name()), newfile)
-	if err := os.Rename(e.to.Name(), newpath); err != nil {
-		return "", errors.Wrap(err, "rename file")
-	}
-
+	// Set metadata before publication: a failure cannot turn a published file
+	// into an apparent failed download, or mark an unpublished file as complete.
 	if e.file.Date > 0 {
+		rel, err := filepath.Rel(p.it.opts.Dir, e.to.Name())
+		if err != nil {
+			return "", err
+		}
 		fileTime := time.Unix(e.file.Date, 0)
-		if err := os.Chtimes(newpath, fileTime, fileTime); err != nil {
+		if err := p.it.root.Chtimes(rel, fileTime, fileTime); err != nil {
 			return "", errors.Wrap(err, "set file time")
 		}
+	}
+	newpath, err := p.it.publish(e, newfile)
+	if err != nil {
+		return "", err
 	}
 
 	return newpath, nil
@@ -175,7 +242,7 @@ func (p *progress) donePost(e *iterElem) (string, error) {
 
 func (p *progress) fail(e *iterElem, err error) {
 	logEngine.Errorf("文件下载失败: task=%s 文件=%s err=%v", p.task.ID, filepath.Base(e.to.Name()), err)
-	p.task.markFileFailed(e.to.Name())
+	p.task.markFileFailed(e.to.Name(), err.Error())
 	p.task.onFileFailed()
 	p.clearSpeedSample(e.id)
 	p.emit(e, e.file.Size, 0, "failed", err)
@@ -192,12 +259,18 @@ func (p *progress) emitWithSpeed(e *iterElem, total, downloaded int64, state str
 }
 
 func (p *progress) buildEvent(e *iterElem, total, downloaded int64, state string, err error) FileEvent {
+	name := e.targetName
+	if name == "" {
+		name = strings.TrimSuffix(filepath.Base(e.to.Name()), tempExt)
+	}
 	ev := FileEvent{
-		TaskID:     p.task.ID,
+		Date: e.info.MessageDate, OriginalName: e.info.FileName,
+		TaskID:    p.task.ID,
+		AccountID: p.task.opts.AccountID, DialogType: peerDialogType(e.from), MediaID: MediaIdentity(e.fromMsg),
 		FileID:     e.id,
 		DialogID:   e.info.DialogID,
 		MessageID:  e.info.MessageID,
-		Name:       strings.TrimSuffix(filepath.Base(e.to.Name()), tempExt),
+		Name:       name,
 		Total:      total,
 		Downloaded: downloaded,
 		State:      state,

@@ -4,6 +4,12 @@
       <div>
         <h1>下载</h1>
         <p>下载任务的实时进度与控制</p>
+        <div v-if="tasks.tasks.length > 0" class="tasks-summary-bar">
+          <span class="sum-item"><i class="pi pi-list" /> {{ tasks.tasks.length }} 个任务</span>
+          <span class="sum-item sum-success"><i class="pi pi-check-circle" /> 成功 {{ totalFinished }}</span>
+          <span v-if="totalFailed > 0" class="sum-item sum-danger"><i class="pi pi-times-circle" /> 失败 {{ totalFailed }}</span>
+          <span v-if="totalSkipped > 0" class="sum-item sum-warn"><i class="pi pi-ban" /> 跳过 {{ totalSkipped }}</span>
+        </div>
       </div>
       <div class="header-actions">
         <div v-if="tasks.totalSpeed > 0" class="total-speed">
@@ -73,7 +79,20 @@
       <div class="row">
         <Tag :value="statusLabel(t.status)" :severity="statusSeverity(t.status)" />
         <span class="title" :title="t.label || (t.urls ?? []).join('\n')">{{ taskTitle(t) }}</span>
-        <span class="meta">{{ t.finished }}/{{ t.total || '?' }} 个文件</span>
+        <div class="task-stats-badges">
+          <span class="stat-badge stat-success" title="成功下载数">
+            <i class="pi pi-check" /> 成功 {{ t.finished }}
+          </span>
+          <span v-if="t.failed > 0" class="stat-badge stat-danger" title="失败数">
+            <i class="pi pi-times" /> 失败 {{ t.failed }}
+          </span>
+          <span v-if="(t.skipped ?? 0) > 0" class="stat-badge stat-warn" title="已跳过数">
+            <i class="pi pi-ban" /> 跳过 {{ t.skipped }}
+          </span>
+          <span class="stat-badge stat-total" title="总文件数">
+            / 共 {{ Math.max(t.total, t.fileCount || 0, t.finished + t.failed + (t.skipped ?? 0)) }} 个
+          </span>
+        </div>
 
         <Button
           icon="pi pi-folder-open"
@@ -143,7 +162,8 @@
           severity="secondary"
           text
           rounded
-          v-tooltip.top="'文件列表'"
+                v-tooltip.top="'文件列表'"
+                aria-label="文件列表"
           @click="toggleFiles(t)"
         />
       </div>
@@ -159,7 +179,9 @@
       <div class="task-meta mt-8">
         <span><i class="pi pi-folder" /> {{ t.dir }}</span>
         <span v-if="t.scriptName"><i class="pi pi-code" /> {{ t.scriptName }}</span>
-        <span v-if="t.failed"><i class="pi pi-exclamation-triangle" /> 失败 {{ t.failed }}</span>
+        <span class="meta-stat-success"><i class="pi pi-check-circle" /> 成功 {{ t.finished }}</span>
+        <span v-if="t.failed" class="meta-stat-failed"><i class="pi pi-exclamation-triangle" /> 失败 {{ t.failed }}</span>
+        <span v-if="t.skipped" class="meta-stat-skipped"><i class="pi pi-ban" /> 跳过 {{ t.skipped }}</span>
         <span v-if="t.fileCount"><i class="pi pi-file" /> 已登记 {{ t.fileCount }} 个文件</span>
         <span v-if="t.speed && t.status === 'running'"><i class="pi pi-bolt" /> {{ fmtSpeed(t.speed) }}</span>
         <span>{{ t.createdAt }}</span>
@@ -186,30 +208,80 @@
         <template v-else>
           <div v-if="!fileLists[t.id]?.length" class="files-hint">无文件记录</div>
           <template v-else>
-            <div v-if="(fileLists[t.id]?.length ?? 0) > 3" class="file-filter">
-              <SearchBox
-                v-model="fileQueries[t.id]"
-                placeholder="搜索文件名/路径"
-                class="grow"
-                size="small"
-                :invalid="fileRegexInvalid(t.id)"
-              />
-              <Button
-                label=".*"
-                size="small"
-                :severity="fileUseRegex[t.id] ? 'primary' : 'secondary'"
-                :outlined="!fileUseRegex[t.id]"
-                v-tooltip.top="'正则表达式'"
-                @click="fileUseRegex[t.id] = !fileUseRegex[t.id]"
-              />
-              <Button
-                label="Aa"
-                size="small"
-                :severity="fileCaseSensitive[t.id] ? 'primary' : 'secondary'"
-                :outlined="!fileCaseSensitive[t.id]"
-                v-tooltip.top="'区分大小写'"
-                @click="fileCaseSensitive[t.id] = !fileCaseSensitive[t.id]"
-              />
+            <div class="file-filter-toolbar">
+              <div class="file-status-filter">
+                <Button
+                  label="全部"
+                  size="small"
+                  :badge="String(fileLists[t.id]?.length ?? 0)"
+                  :severity="(!fileStatusFilter[t.id] || fileStatusFilter[t.id] === 'all') ? 'primary' : 'secondary'"
+                  :outlined="fileStatusFilter[t.id] !== 'all' && Boolean(fileStatusFilter[t.id])"
+                  @click="fileStatusFilter[t.id] = 'all'"
+                />
+                <Button
+                  label="成功"
+                  size="small"
+                  :badge="String(fileCountByState(t.id, 'done'))"
+                  badge-severity="success"
+                  :severity="fileStatusFilter[t.id] === 'done' ? 'success' : 'secondary'"
+                  :outlined="fileStatusFilter[t.id] !== 'done'"
+                  @click="fileStatusFilter[t.id] = 'done'"
+                />
+                <Button
+                  v-if="fileCountByState(t.id, 'failed') > 0"
+                  label="失败"
+                  size="small"
+                  :badge="String(fileCountByState(t.id, 'failed'))"
+                  badge-severity="danger"
+                  :severity="fileStatusFilter[t.id] === 'failed' ? 'danger' : 'secondary'"
+                  :outlined="fileStatusFilter[t.id] !== 'failed'"
+                  @click="fileStatusFilter[t.id] = 'failed'"
+                />
+                <Button
+                  v-if="fileCountByState(t.id, 'skipped') > 0"
+                  label="已跳过"
+                  size="small"
+                  :badge="String(fileCountByState(t.id, 'skipped'))"
+                  badge-severity="warn"
+                  :severity="fileStatusFilter[t.id] === 'skipped' ? 'warn' : 'secondary'"
+                  :outlined="fileStatusFilter[t.id] !== 'skipped'"
+                  @click="fileStatusFilter[t.id] = 'skipped'"
+                />
+                <Button
+                  :label="isAllSelected(t.id) ? '取消全选' : '全选'"
+                  size="small"
+                  severity="secondary"
+                  text
+                  :icon="isAllSelected(t.id) ? 'pi pi-check-square' : 'pi pi-stop'"
+                  v-tooltip.top="'全选/取消全选当前筛选的文件'"
+                  @click="toggleSelectAll(t.id)"
+                />
+              </div>
+              <div class="file-search-bar">
+                <SearchBox
+                  v-model="fileQueries[t.id]"
+                  placeholder="搜索文件名/路径/原因"
+                  class="grow"
+                  size="small"
+                  :invalid="fileRegexInvalid(t.id)"
+                />
+                <Button
+                  label=".*"
+                  size="small"
+                  :severity="fileUseRegex[t.id] ? 'primary' : 'secondary'"
+                  :outlined="!fileUseRegex[t.id]"
+                  v-tooltip.top="'正则表达式'"
+                  @click="fileUseRegex[t.id] = !fileUseRegex[t.id]"
+                />
+                <Button
+                  label="Aa"
+                  size="small"
+                  :severity="fileCaseSensitive[t.id] ? 'primary' : 'secondary'"
+                  :outlined="!fileCaseSensitive[t.id]"
+                  v-tooltip.top="'区分大小写'"
+                  @click="fileCaseSensitive[t.id] = !fileCaseSensitive[t.id]"
+                />
+              </div>
             </div>
             <div v-if="fileRegexInvalid(t.id)" class="regex-error">正则表达式无效（已退化为不过滤）</div>
             <div v-if="!filteredFiles(t.id).length" class="files-hint">没有匹配的文件</div>
@@ -217,6 +289,7 @@
           <div v-for="f in filteredFiles(t.id)" :key="f.path" class="task-file-row">
             <Checkbox v-model="selectedPaths[t.id]" :value="f.path" />
             <span class="name" :title="f.path">{{ f.name }}</span>
+            <span v-if="f.reason" class="file-reason" :title="f.reason">{{ f.reason }}</span>
             <span class="size">{{ fmtSize(f.size) }}</span>
             <Tag
               :value="fileStateLabel(f.state)"
@@ -225,7 +298,8 @@
             />
             <div class="file-actions">
               <Button
-                v-if="f.state === 'failed' || f.state === 'done'"
+                v-if="f.state === 'failed' || f.state === 'done' || f.state === 'skipped'"
+                :disabled="t.status === 'running' || t.status === 'queued'"
                 icon="pi pi-refresh"
                 severity="secondary"
                 text
@@ -235,6 +309,7 @@
                 @click="onRedownloadFile(t.id, f.path)"
               />
               <Button
+                v-if="f.state !== 'skipped'"
                 icon="pi pi-folder-open"
                 severity="secondary"
                 text
@@ -259,11 +334,20 @@
                 rounded
                 size="small"
                 v-tooltip.top="'删除文件'"
+                v-if="f.state !== 'skipped'"
                 @click="onDeleteFile(t.id, f.path)"
               />
             </div>
           </div>
           <div v-if="selectedPaths[t.id]?.length" class="files-actions">
+            <Button
+              :label="`重新下载选中（${selectedPaths[t.id].length}）`"
+              :disabled="t.status === 'running' || t.status === 'queued'"
+              icon="pi pi-refresh"
+              severity="primary"
+              size="small"
+              @click="onRedownloadSelected(t)"
+            />
             <Button
               :label="`删除选中文件（${selectedPaths[t.id].length}）`"
               icon="pi pi-trash"
@@ -320,11 +404,21 @@ onUnmounted(() => {
   }
 })
 
+// 全局统计指标汇总
+const totalFinished = computed(() => tasks.tasks.reduce((sum, t) => sum + (t.finished || 0), 0))
+const totalFailed = computed(() => tasks.tasks.reduce((sum, t) => sum + (t.failed || 0), 0))
+const totalSkipped = computed(() => tasks.tasks.reduce((sum, t) => sum + (t.skipped || 0), 0))
+
 // 任务文件列表的展开与多选状态
 const expanded = reactive<Record<string, boolean>>({})
 const loadingFiles = reactive<Record<string, boolean>>({})
 const fileLists = reactive<Record<string, TaskFile[]>>({})
 const selectedPaths = reactive<Record<string, string[]>>({})
+const fileStatusFilter = reactive<Record<string, 'all' | 'done' | 'failed' | 'skipped'>>({})
+
+function fileCountByState(taskId: string, state: string): number {
+  return (fileLists[taskId] ?? []).filter((f) => f.state === state).length
+}
 
 // 任务级搜索过滤状态
 const query = ref('')
@@ -376,8 +470,9 @@ function taskTitle(t: TaskView) {
 
 function taskPercent(t: TaskView) {
   if (t.status === 'done') return 100
-  if (!t.total) return 0
-  return Math.round(((t.finished + t.failed) / t.total) * 100)
+  const total = t.total || (t.finished + t.failed + (t.skipped ?? 0))
+  if (!total) return 0
+  return Math.min(100, Math.round(((t.finished + t.failed + (t.skipped ?? 0)) / total) * 100))
 }
 
 const filteredTasks = computed(() => {
@@ -389,10 +484,14 @@ const filteredTasks = computed(() => {
 })
 
 function filteredFiles(taskId: string): TaskFile[] {
-  const list = fileLists[taskId] ?? []
+  let list = fileLists[taskId] ?? []
+  const filter = fileStatusFilter[taskId] ?? 'all'
+  if (filter !== 'all') {
+    list = list.filter((f) => f.state === filter)
+  }
   const m = buildMatcher(fileQueries[taskId] ?? '', fileUseRegex[taskId] ?? false, fileCaseSensitive[taskId] ?? false)
   if (!m) return list
-  return list.filter((f) => m(f.name) || m(f.path))
+  return list.filter((f) => m(f.name) || m(f.path) || (f.reason && m(f.reason)))
 }
 
 function fileRegexInvalid(taskId: string): boolean {
@@ -410,6 +509,7 @@ watch(
         delete loadingFiles[key]
         delete fileLists[key]
         delete selectedPaths[key]
+        delete fileStatusFilter[key]
         delete fileQueries[key]
         delete fileUseRegex[key]
         delete fileCaseSensitive[key]
@@ -568,6 +668,43 @@ async function onRedownloadFile(taskId: string, filePath: string) {
   }
 }
 
+// 批量重新下载选中的文件（如批量重新下载跳过或失败的文件）
+async function onRedownloadSelected(t: TaskView) {
+  const paths = selectedPaths[t.id] ?? []
+  if (!paths.length) return
+  try {
+    await tasks.redownloadFiles(t.id, paths)
+    selectedPaths[t.id] = []
+    fileLists[t.id] = (await Download.listTaskFiles(t.id)) ?? []
+    toast.add({ severity: 'success', summary: `已创建重下任务（${paths.length} 个文件）`, life: 3000 })
+  } catch (e) {
+    toast.add({ severity: 'error', summary: '重新下载失败', detail: String(e), life: 5000 })
+  }
+}
+
+function isAllSelected(taskId: string): boolean {
+  const current = filteredFiles(taskId)
+  if (!current.length) return false
+  const selected = new Set(selectedPaths[taskId] ?? [])
+  return current.every((f) => selected.has(f.path))
+}
+
+function toggleSelectAll(taskId: string) {
+  const current = filteredFiles(taskId)
+  if (!current.length) return
+  if (!selectedPaths[taskId]) selectedPaths[taskId] = []
+  if (isAllSelected(taskId)) {
+    const currentPaths = new Set(current.map((f) => f.path))
+    selectedPaths[taskId] = selectedPaths[taskId].filter((p) => !currentPaths.has(p))
+  } else {
+    const set = new Set(selectedPaths[taskId])
+    for (const f of current) {
+      set.add(f.path)
+    }
+    selectedPaths[taskId] = Array.from(set)
+  }
+}
+
 // 打开文件所在目录并选中
 async function onRevealFile(filePath: string) {
   try {
@@ -612,6 +749,7 @@ const fileStateText: Record<string, string> = {
   downloading: '未完成',
   done: '已完成',
   failed: '失败',
+  skipped: '已跳过',
 }
 
 function fileStateLabel(s: string) {
@@ -624,8 +762,10 @@ function fileStateSeverity(s: string) {
       return 'success'
     case 'failed':
       return 'danger'
-    default:
+    case 'skipped':
       return 'warn'
+    default:
+      return 'info'
   }
 }
 
@@ -830,6 +970,9 @@ function isFinal(s: string) {
 }
 
 .files-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   margin-top: 8px;
 }
 
@@ -846,5 +989,174 @@ function isFinal(s: string) {
 
 .file-actions :deep(.p-button .p-button-icon) {
   font-size: 12px;
+}
+
+/* 顶部全局统计汇总条 */
+.tasks-summary-bar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 6px;
+  font-size: 12px;
+  flex-wrap: wrap;
+}
+
+.sum-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: var(--p-text-muted-color);
+}
+
+.sum-item.sum-success {
+  color: var(--p-green-600);
+  font-weight: 500;
+}
+
+.app-dark .sum-item.sum-success {
+  color: var(--p-green-400);
+}
+
+.sum-item.sum-danger {
+  color: var(--p-red-500);
+  font-weight: 500;
+}
+
+.app-dark .sum-item.sum-danger {
+  color: var(--p-red-400);
+}
+
+.sum-item.sum-warn {
+  color: var(--p-orange-500);
+  font-weight: 500;
+}
+
+.app-dark .sum-item.sum-warn {
+  color: var(--p-orange-400);
+}
+
+/* 任务卡片头部状态统计徽章 */
+.task-stats-badges {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.stat-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 2px 7px;
+  border-radius: 4px;
+  font-weight: 500;
+}
+
+.stat-badge.stat-success {
+  background: var(--p-green-50);
+  color: var(--p-green-700);
+}
+
+.app-dark .stat-badge.stat-success {
+  background: var(--p-green-950);
+  color: var(--p-green-300);
+}
+
+.stat-badge.stat-danger {
+  background: var(--p-red-50);
+  color: var(--p-red-700);
+}
+
+.app-dark .stat-badge.stat-danger {
+  background: var(--p-red-950);
+  color: var(--p-red-300);
+}
+
+.stat-badge.stat-warn {
+  background: var(--p-orange-50);
+  color: var(--p-orange-700);
+}
+
+.app-dark .stat-badge.stat-warn {
+  background: var(--p-orange-950);
+  color: var(--p-orange-300);
+}
+
+.stat-badge.stat-total {
+  color: var(--p-text-muted-color);
+  padding: 0 2px;
+}
+
+.meta-stat-success {
+  color: var(--p-green-600);
+  font-weight: 500;
+}
+
+.app-dark .meta-stat-success {
+  color: var(--p-green-400);
+}
+
+.meta-stat-failed {
+  color: var(--p-red-500);
+  font-weight: 500;
+}
+
+.app-dark .meta-stat-failed {
+  color: var(--p-red-400);
+}
+
+.meta-stat-skipped {
+  color: var(--p-orange-500);
+  font-weight: 500;
+}
+
+.app-dark .meta-stat-skipped {
+  color: var(--p-orange-400);
+}
+
+/* 文件过滤工具栏 */
+.file-filter-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 4px 0 8px;
+  flex-wrap: wrap;
+}
+
+.file-status-filter {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.file-search-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1;
+  min-width: 220px;
+  justify-content: flex-end;
+}
+
+.file-search-bar .grow,
+.file-search-bar .grow :deep(.p-inputtext) {
+  width: 100%;
+}
+
+.file-reason {
+  color: var(--p-orange-600);
+  background: var(--p-orange-50);
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.app-dark .file-reason {
+  color: var(--p-orange-300);
+  background: var(--p-orange-950);
 }
 </style>

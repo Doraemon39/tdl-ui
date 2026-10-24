@@ -62,6 +62,7 @@ export function typeLabel(t: string): string {
   switch (t) {
     case 'private':
       return '私聊'
+    case 'supergroup':
     case 'group':
       return '群组'
     case 'channel':
@@ -76,6 +77,7 @@ export function typeSeverity(t: string): 'success' | 'info' | 'warn' | 'secondar
   switch (t) {
     case 'private':
       return 'success'
+    case 'supergroup':
     case 'group':
       return 'info'
     case 'channel':
@@ -90,6 +92,7 @@ export function typeIcon(t: string): string {
   switch (t) {
     case 'private':
       return 'pi pi-user'
+    case 'supergroup':
     case 'group':
       return 'pi pi-users'
     case 'channel':
@@ -142,4 +145,13 @@ export function mediaErrorText(code?: number): string {
     default:
       return '视频加载失败，请重试或下载后观看'
   }
+}
+
+/** MTProto peer namespace: supergroups and channels share the channel class. */
+export function peerNamespace(type: string): string {
+  return type === 'supergroup' ? 'channel' : type
+}
+export function fmtMessageTime(unixSeconds: number): string {
+  if (!unixSeconds) return '—'
+  return new Intl.DateTimeFormat('zh-CN', {year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',timeZoneName:'short',hour12:false}).format(new Date(unixSeconds * 1000))
 }

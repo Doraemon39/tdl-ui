@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { SettingsApi } from '../api'
+import { EVENT_APP_BEFORE_CLOSE, on, SettingsApi } from '../api'
 import { getTheme, setTheme, type ThemeMode } from '../theme'
 import type { Settings } from '../types'
 import { config } from '../../wailsjs/go/models'
@@ -10,10 +10,13 @@ const defaults = (): Settings =>
     proxyMode: 'system',
     downloadDir: '',
     template: '',
+    conflictAction: 'skip',
+    conflictCheck: 'origin',
     threads: 4,
     limit: 2,
     poolSize: 8,
     theme: 'system',
+    exitAction: 'prompt',
     cacheDir: '',
     tempDir: '',
     loggedInUserId: 0,
@@ -34,17 +37,24 @@ const defaults = (): Settings =>
     },
   })
 
+const subscriptions: Array<() => void> = []
+import.meta.hot?.dispose(() => subscriptions.splice(0).forEach(off => off()))
+
 /** 应用设置。 */
 export const useSettingsStore = defineStore('settings', {
   state: () => ({
     settings: defaults(),
     dataDir: '',
+    isPortable: false,
+    exitRequested: false,
+    exitChoice: 'direct',
     inited: false,
   }),
   actions: {
     async init() {
       if (this.inited) return
       this.inited = true
+      subscriptions.push(on(EVENT_APP_BEFORE_CLOSE, () => { if (!this.exitRequested) { this.exitChoice = 'direct'; this.exitRequested = true } }))
       try {
         const remote = await SettingsApi.get()
         // 旧版本 settings.json 可能缺少 log 字段，用默认值兜底防表单绑定 undefined
@@ -55,6 +65,7 @@ export const useSettingsStore = defineStore('settings', {
           log: { ...defaults().log, ...(remote.log ?? {}) },
         })
         this.dataDir = await SettingsApi.dataDir()
+        this.isPortable = await SettingsApi.isPortable()
       } catch {
         /* 非 Wails 环境忽略 */
       }
@@ -63,6 +74,12 @@ export const useSettingsStore = defineStore('settings', {
     },
     async save() {
       await SettingsApi.save(config.Settings.createFrom(this.settings))
+    },
+    async openDataDir() {
+      await SettingsApi.openDataDir()
+    },
+    async quitApp(action: string, remember: boolean) {
+      await SettingsApi.quitApp(action, remember)
     },
     applyTheme(mode: ThemeMode) {
       this.settings.theme = mode

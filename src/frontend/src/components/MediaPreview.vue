@@ -273,7 +273,7 @@ const videoPlayable = computed(
 const videoSrc = computed(() => {
   if (!item.value) return ''
   return downloaded.value
-    ? localMediaURL(item.value.dialogId, item.value.messageId)
+    ? localMediaURL(item.value.dialogId,item.value.messageId,props.dialogType)
     : videoStreamURL(item.value.dialogId, props.dialogType, item.value.messageId)
 })
 

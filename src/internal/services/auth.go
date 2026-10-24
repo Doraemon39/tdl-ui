@@ -126,9 +126,17 @@ func (s *AuthService) StartCodeLogin(phone string) error {
 		return err
 	}
 	logAuth.Infof("启动验证码登录: %s", maskPhone(phone))
+	release, err := s.cfg.ChangeSession()
+	if err != nil {
+		return err
+	}
+	if s.HasActiveDownloads != nil && s.HasActiveDownloads() {
+		release()
+		return errors.New("存在进行中的下载任务")
+	}
 
 	flow := s.begin()
-	go s.runCodeLogin(flow, phone)
+	go func() { defer release(); s.runCodeLogin(flow, phone) }()
 	return nil
 }
 
@@ -138,8 +146,16 @@ func (s *AuthService) StartQRLogin() error {
 		return err
 	}
 	logAuth.Infof("启动二维码登录")
+	release, err := s.cfg.ChangeSession()
+	if err != nil {
+		return err
+	}
+	if s.HasActiveDownloads != nil && s.HasActiveDownloads() {
+		release()
+		return errors.New("存在进行中的下载任务")
+	}
 	flow := s.begin()
-	go s.runQRLogin(flow)
+	go func() { defer release(); s.runQRLogin(flow) }()
 	return nil
 }
 
@@ -213,6 +229,17 @@ func (s *AuthService) Logout() error {
 		return err
 	}
 	logAuth.Infof("开始登出，清除本地会话")
+	if s.OnSessionChanged != nil {
+		s.OnSessionChanged()
+	}
+	release, err := s.cfg.ChangeSession()
+	if err != nil {
+		return err
+	}
+	defer release()
+	if s.HasActiveDownloads != nil && s.HasActiveDownloads() {
+		return errors.New("存在进行中的下载任务")
+	}
 	kvd, err := s.kv.Open(engine.Namespace)
 	if err != nil {
 		logAuth.Errorf("登出失败（open kv）: %v", err)
@@ -302,6 +329,14 @@ func (s *AuthService) ListDesktopAccounts(path, passcode string) ([]DesktopAccou
 func (s *AuthService) ImportDesktopSession(path, passcode, userID string) error {
 	if err := s.prepareLogin(); err != nil {
 		return err
+	}
+	release, err := s.cfg.ChangeSession()
+	if err != nil {
+		return err
+	}
+	defer release()
+	if s.HasActiveDownloads != nil && s.HasActiveDownloads() {
+		return errors.New("存在进行中的下载任务")
 	}
 	logAuth.Infof("导入 Desktop 会话，账号 %s", userID)
 	accounts, err := tdtdesktop.Read(appendTData(path), []byte(passcode))
@@ -676,3 +711,6 @@ func (a *guiAuth) SignUp(_ context.Context) (auth.UserInfo, error) {
 func (a *guiAuth) AcceptTermsOfService(_ context.Context, tos tg.HelpTermsOfService) error {
 	return &auth.SignUpRequired{TermsOfService: tos}
 }
+
+// Shutdown cancels and joins the login flow before session storage can close.
+func (s *AuthService) Shutdown() error { return s.cancelLoginAndWait(5 * time.Second) }

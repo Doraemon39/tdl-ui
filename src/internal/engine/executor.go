@@ -2,7 +2,6 @@ package engine
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	"github.com/go-faster/errors"
@@ -16,7 +15,6 @@ import (
 	"github.com/iyear/tdl/pkg/tmessage"
 
 	"tdl-ui/internal/config"
-	"tdl-ui/internal/events"
 	"tdl-ui/internal/scriptapi"
 	"tdl-ui/internal/store"
 )
@@ -55,7 +53,6 @@ func (m *Manager) run(t *Task) {
 
 	t.mu.Lock()
 	t.cancel = nil
-	t.runDone = nil
 	switch {
 	case err == nil:
 		t.status = StatusDone
@@ -71,7 +68,6 @@ func (m *Manager) run(t *Task) {
 	}
 	status := t.status
 	t.mu.Unlock()
-	close(runDone)
 
 	if status == StatusFailed {
 		logEngine.Errorf("任务失败: id=%s err=%v", t.ID, err)
@@ -81,12 +77,43 @@ func (m *Manager) run(t *Task) {
 
 	t.emitUpdate()
 	_ = t.contracts.SafeOnTaskDone(t.info())
+	t.mu.Lock()
+	t.runDone = nil
+	t.manifest = nil
+	t.mu.Unlock()
+	close(runDone)
 }
 
 // execute 单次任务执行：建连 → 解析链接 → 装配迭代器 → 断点续传 → 下载。
 // 装配流程对应 ref/tdl/app/dl/dl.go 的 Run。
 func (m *Manager) execute(ctx context.Context, t *Task) (rerr error) {
-	settings := m.deps.Cfg.Get()
+	release, err := m.deps.Cfg.UseSession()
+	if err != nil {
+		return err
+	}
+	defer release()
+	if err := normalizeTaskPolicies(&t.opts); err != nil {
+		return err
+	}
+	var settings config.Settings
+	if m.deps.Cfg != nil {
+		settings = m.deps.Cfg.Get()
+	} else {
+		settings = config.Settings{Threads: 4, Limit: 2, ProgressIntervalMs: 500}
+	}
+	if t.opts.ManifestPath != "" {
+		session, err := m.manifests.Open(t.opts.ManifestPath, settings.LoggedInUserID)
+		if err != nil {
+			return err
+		}
+		t.manifest = session
+	}
+	t.mu.Lock()
+	t.manifestError = ""
+	t.mu.Unlock()
+	if m.deps.Cfg != nil && (t.opts.AccountID <= 0 || t.opts.AccountID != settings.LoggedInUserID) {
+		return errors.New("任务账号与当前会话不一致，请重新选择来源")
+	}
 
 	// 每轮从 task_items 表重组装 URLs/Selections，与持久化的消息项保持一致。
 	urls, selections := t.opts.URLs, t.opts.Selections
@@ -119,21 +146,28 @@ func (m *Manager) execute(ctx context.Context, t *Task) (rerr error) {
 	}
 
 	return coretclient.RunWithAuth(ctx, c, func(ctx context.Context) error {
+		self, err := c.Self(ctx)
+		if err != nil {
+			return err
+		}
+		if self.ID != t.opts.AccountID {
+			return errors.New("实际登录账号与任务归属不一致，已停止下载")
+		}
 		pool := dcpool.NewPool(c,
 			int64(settings.PoolSize),
 			coretclient.NewDefaultMiddlewares(ctx, reconnectTimeout)...)
 		defer func() { _ = pool.Close() }()
 
+		manager := peers.Options{Storage: storage.NewPeers(kvd)}.Build(pool.Default(ctx))
 		var dialogs []*tmessage.Dialog
+		single := map[string]bool{}
 		if len(urls) > 0 {
-			d, err := tmessage.Parse(tmessage.FromURL(ctx, pool, kvd, urls))
+			var err error
+			dialogs, single, err = resolveMessageLinks(ctx, manager, urls)
 			if err != nil {
 				return errors.Wrap(err, "解析消息链接失败")
 			}
-			dialogs = d
 		}
-
-		manager := peers.Options{Storage: storage.NewPeers(kvd)}.Build(pool.Default(ctx))
 
 		// 选集下载：按对话 + 消息 ID 直接解析，与链接结果合并
 		if len(selections) > 0 {
@@ -144,17 +178,31 @@ func (m *Manager) execute(ctx context.Context, t *Task) (rerr error) {
 			dialogs = append(dialogs, d...)
 		}
 
+		origins := map[string]string{}
+		if t.opts.ConflictCheck == "origin" && t.opts.ConflictAction != "smart" {
+			var err error
+			origins, err = m.knownOrigins(t.opts.Dir)
+			if err != nil {
+				return errors.Wrap(err, "读取原始文件名记录失败")
+			}
+		}
+		localMatches, err := m.KnownLocalMatches(t.opts.Dir)
+		if err != nil {
+			return err
+		}
 		it, err := newIter(pool, manager, dialogs, IterOptions{
-			Dir:        t.opts.Dir,
-			RewriteExt: t.opts.RewriteExt,
-			SkipSame:   t.opts.SkipSame,
-			Template:   t.opts.Template,
-			Group:      t.opts.Group,
-			Contracts:  t.contracts,
-			Renames:    t.opts.Renames,
-			OnSkip: func(info scriptapi.FileInfo, reason string) {
-				m.deps.Emitter.Emit(events.ScriptLog,
-					fmt.Sprintf("[%s] %s: %s", t.ID, info.FileName, reason))
+			OverwriteKeys: t.opts.OverwriteKeys,
+			LocalMatches:  localMatches, RecordManifest: t.opts.RecordManifest,
+			Dir: t.opts.Dir, SingleKeys: single, Manifest: t.manifest, ManifestMode: t.opts.ManifestMode,
+			RewriteExt:     t.opts.RewriteExt,
+			SkipSame:       t.opts.SkipSame,
+			ConflictAction: t.opts.ConflictAction, ConflictCheck: t.opts.ConflictCheck, KnownOrigins: origins, Outputs: &m.outputs, TargetNames: t.opts.TargetNames,
+			Template:  t.opts.Template,
+			Group:     t.opts.Group,
+			Contracts: t.contracts,
+			Renames:   t.opts.Renames,
+			OnSkip: func(info scriptapi.FileInfo, name, reason, dialogType string) {
+				t.onFileSkipped(TaskFile{Name: name, Size: info.FileSize, State: "skipped", Reason: reason, DialogID: info.DialogID, MessageID: info.MessageID, OriginalName: info.FileName, DialogType: dialogType})
 			},
 			OnTotalDecr: func() {
 				// ENG-06：被跳过的消息同步递减 total，保证任务 Done 时 finished 能追平 total；
@@ -175,6 +223,9 @@ func (m *Manager) execute(ctx context.Context, t *Task) (rerr error) {
 		t.mu.Lock()
 		t.total = it.Total()
 		t.mu.Unlock()
+		if err := it.prepareLocal(ctx); err != nil {
+			return err
+		}
 
 		// 断点续传：从 resume_keys 加载已完成集合（内容坐标）；Restart 则清空进度
 		if t.opts.Restart {
@@ -186,11 +237,28 @@ func (m *Manager) execute(ctx context.Context, t *Task) (rerr error) {
 			if err != nil {
 				return errors.Wrap(err, "加载断点失败")
 			}
+			t.mu.Lock()
+			for _, f := range t.files {
+				if f.State == "done" {
+					finished[resumeKey(f.DialogID, f.MessageID, f.DialogType)] = struct{}{}
+				}
+			}
+			t.mu.Unlock()
 			it.SetFinished(finished)
 		}
 
 		t.mu.Lock()
-		t.finished = len(it.Finished())
+		t.finished = 0
+		t.failed = 0
+		t.skipped = 0
+		for _, f := range t.files {
+			switch f.State {
+			case "done":
+				t.finished++
+			case "skipped":
+				t.skipped++
+			}
+		}
 		t.mu.Unlock()
 		t.emitUpdate()
 
@@ -204,11 +272,13 @@ func (m *Manager) execute(ctx context.Context, t *Task) (rerr error) {
 					rerr = errors.Wrapf(rerr, "save resume: %v", saveErr)
 				}
 			} else {
-				_ = m.deps.Store.DeleteResume(context.Background(), t.ID)
+				if err := m.deps.Store.SaveFinished(context.Background(), t.ID, it.Finished()); err != nil {
+					logStoreErr(err, "保存断点失败: %v", err)
+				}
 			}
 		}()
 
-		return downloader.New(downloader.Options{
+		derr := downloader.New(downloader.Options{
 			Pool:    pool,
 			Threads: settings.Threads,
 			Iter:    it,
@@ -216,5 +286,19 @@ func (m *Manager) execute(ctx context.Context, t *Task) (rerr error) {
 			Progress: newProgress(t, it, t.opts.RewriteExt,
 				time.Duration(settings.ProgressIntervalMs)*time.Millisecond),
 		}).Download(ctx, settings.Limit)
+		if derr == nil {
+			t.mu.Lock()
+			t.total = it.discovered
+			failed := t.failed
+			manifestError := t.manifestError
+			t.mu.Unlock()
+			if manifestError != "" {
+				return errors.New("文件已保存，但清单未能更新：" + manifestError)
+			}
+			if failed > 0 {
+				return errors.New("部分文件未能完成保存，请查看失败记录后重试")
+			}
+		}
+		return derr
 	})
 }

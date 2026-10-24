@@ -6,7 +6,7 @@
 
 | 工具 | 最低版本 | 说明 |
 | --- | --- | --- |
-| Go | 1.25+ | tdl 子模块声明 go 1.25.x，Go 工具链会按 `GOTOOLCHAIN=auto` 自动下载匹配版本 |
+| Go | 1.26+ | 安全更新后的依赖要求 1.26；发布请使用当前安全修订版，本次交付使用 1.27.3 |
 | Node.js | 20+ | 前端构建 |
 | pnpm | 9+ | 前端包管理（项目约定，勿用 npm/yarn） |
 | Wails CLI | v2.11+ | `go install github.com/wailsapp/wails/v2/cmd/wails@latest` |

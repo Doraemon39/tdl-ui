@@ -26,7 +26,9 @@ type iterElem struct {
 	file    *tmedia.Media
 	info    scriptapi.FileInfo // 供脚本钩子使用的元信息
 
-	to *os.File
+	to           *os.File
+	targetName   string // 最终目标文件名（不含临时后缀）
+	outputAction string
 
 	takeout bool
 }

@@ -18,7 +18,7 @@
 
     <div class="form-field">
       <label for="el-dir">保存目录</label>
-      <DirSelect id="el-dir" v-model="dir" kind="logExport" />
+      <DirSelect id="el-dir" ref="dirSelect" v-model="dir" kind="logExport" placeholder="选择或输入日志导出目录" />
     </div>
 
     <div class="form-field">
@@ -45,6 +45,7 @@ import SelectButton from 'primevue/selectbutton'
 import DirSelect from './DirSelect.vue'
 import { LogApi } from '../api'
 import type { LogEntry } from '../types'
+import { useSettingsStore } from '../stores/settings'
 
 const props = defineProps<{
   visible: boolean
@@ -57,10 +58,12 @@ const emit = defineEmits<{
 }>()
 
 const toast = useToast()
+const settings = useSettingsStore()
 
 const range = ref<'filtered' | 'all'>('filtered')
 const format = ref<'.log' | '.txt' | '.csv'>('.log')
-const dir = ref('')
+const dir = ref(settings.settings.downloadDir || '')
+const dirSelect = ref<InstanceType<typeof DirSelect> | null>(null)
 const name = ref(`tdl-ui-log-${fmtNow()}`)
 const exporting = ref(false)
 
@@ -88,6 +91,10 @@ const fullName = computed(() => {
 watch(() => props.visible, (v) => {
   if (v) {
     name.value = `tdl-ui-log-${fmtNow()}`
+    if (!dir.value) {
+      dir.value = settings.settings.downloadDir || ''
+    }
+    dirSelect.value?.reload?.()
   }
 })
 
@@ -155,6 +162,7 @@ async function doExport() {
     const content = buildContent()
     const path = await LogApi.exportLogs(dir.value, fullName.value, content)
     toast.add({ severity: 'success', summary: '日志已导出', detail: path, life: 4000 })
+    dirSelect.value?.commit()
     close()
   } catch (e: any) {
     toast.add({ severity: 'error', summary: '导出失败', detail: String(e), life: 5000 })

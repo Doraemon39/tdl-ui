@@ -252,18 +252,15 @@ func TestFusedFilterSkipsImmediately(t *testing.T) {
 	callTimeout = 50 * time.Millisecond
 	defer func() { callTimeout = old }()
 
-	// 长阻塞模拟死循环：泄漏的执行体停在 Sleep 中，不吃测试进程 CPU
+	// Interpreted loops must be canceled instead of leaking a sleeping worker.
 	src := `package main
 
 import (
-	"time"
-
 	"tdlui/api"
 )
 
 func Filter(f api.FileInfo) bool {
-	time.Sleep(time.Hour)
-	return true
+	for {}
 }
 `
 	c, err := Load(src)

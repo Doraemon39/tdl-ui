@@ -3,6 +3,7 @@ package logging
 import (
 	"fmt"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -12,6 +13,12 @@ import (
 	"go.uber.org/zap/zapcore"
 	"gopkg.in/natefinch/lumberjack.v2"
 )
+
+var credentialURL = regexp.MustCompile(`(?i)(https?|socks5)://[^\s/@]+@`)
+
+func redactCredentials(message string) string {
+	return credentialURL.ReplaceAllString(message, "$1://[redacted]@")
+}
 
 // LogEntry 单条日志的结构化视图，随 log:batch 事件推送给前端。
 type LogEntry struct {
@@ -74,17 +81,13 @@ func (s *sink) reconfigure(cfg LogSettings) {
 	s.fileErrLogged = false
 	s.settings = cfg
 	if cfg.fileEnabled() {
-		// LOG-03：目录可写探测；Program Files 等只读位置回退到用户缓存目录，
-		// 并向 UI ring 写一条 WARN，避免文件日志整体静默失效
+		// Keep the configured privacy boundary: a failed portable/custom log
+		// directory must never silently redirect logs into the user's system cache.
 		if err := ensureWritableDir(cfg.Dir); err != nil {
-			if fallback := fallbackLogDir(); fallback != "" && ensureWritableDir(fallback) == nil {
-				s.noteLocked("WARN", fmt.Sprintf("日志目录不可写（%s: %v），已回退到 %s", cfg.Dir, err, fallback))
-				cfg.Dir = fallback
-				s.settings = cfg
-			} else {
-				s.noteLocked("WARN", fmt.Sprintf("日志目录不可写（%s: %v），文件日志可能失效", cfg.Dir, err))
-			}
+			s.noteLocked("WARN", fmt.Sprintf("日志目录不可写（%s: %v），已禁用文件日志；界面日志仍可用", cfg.Dir, err))
+			return
 		}
+
 		s.file = &lumberjack.Logger{
 			Filename:   filepath.Join(cfg.Dir, FileName),
 			MaxSize:    cfg.MaxSizeMB,
@@ -141,7 +144,7 @@ func (s *sink) Write(ent zapcore.Entry, fields []zapcore.Field) error {
 		File:   filepath.Base(ent.Caller.File),
 		Func:   shortFunc(ent.Caller.Function),
 		Line:   ent.Caller.Line,
-		Msg:    appendFields(ent.Message, fields),
+		Msg:    redactCredentials(appendFields(ent.Message, fields)),
 	}
 	e.Text = formatEntry(s.settings.Format, e)
 	file := s.file

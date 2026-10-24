@@ -2,13 +2,16 @@ package services
 
 import (
 	"errors"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
+	"tdl-ui/internal/safeio"
 )
 
 // 缓存种类（对应语义化子目录）。
@@ -20,7 +23,8 @@ const (
 // thumbCache 缩略图磁盘缓存：缓存根由 rootFn 每次求值，配置变更即时生效。
 // 文件名 <dialogID>_<messageID>.jpg 全局唯一，天然防重复防覆盖。
 type thumbCache struct {
-	rootFn func() string
+	rootFn  func() string
+	trusted func(string) bool
 
 	mu       sync.Mutex
 	epoch    uint64                   // 清空代际号：Clear 时递增，使在途写盘自我作废（LOGIC-002）
@@ -28,9 +32,14 @@ type thumbCache struct {
 }
 
 // newThumbCache 缓存根由 rootFn 注入（通常为 config.Manager.CacheDir）。
-func newThumbCache(rootFn func() string) *thumbCache {
+func newThumbCache(rootFn func() string, trusted ...func(string) bool) *thumbCache {
+	check := func(string) bool { return true }
+	if len(trusted) > 0 {
+		check = trusted[0]
+	}
 	return &thumbCache{
 		rootFn:   rootFn,
+		trusted:  check,
 		inflight: make(map[string]chan struct{}),
 	}
 }
@@ -44,9 +53,12 @@ func (c *thumbCache) path(kind string, dialogID int64, messageID int) string {
 // Get 命中磁盘缓存直接读；未命中经 fetch 拉取并原子落盘。
 // 同一 key 的并发请求仅触发一次拉取，其余等待后重读缓存。
 func (c *thumbCache) Get(kind string, dialogID int64, messageID int, fetch func() ([]byte, error)) ([]byte, error) {
+	if err := c.ensureKind(kind); err != nil {
+		return nil, err
+	}
 	p := c.path(kind, dialogID, messageID)
 	for {
-		if b, err := os.ReadFile(p); err == nil {
+		if b, err := readCacheFile(p, 32<<20); err == nil {
 			return b, nil
 		}
 
@@ -92,39 +104,41 @@ func (c *thumbCache) Clear() error {
 	c.epoch++ // 作废所有清空前发起的在途写盘
 	root := c.rootFn()
 	for _, kind := range []string{cacheKindThumb, cacheKindPreview} {
+		if err := c.ensureKind(kind); err != nil {
+			return err
+		}
 		sub := filepath.Join(root, kind)
-		if err := os.RemoveAll(sub); err != nil {
+		if err := safeio.RemoveChild(root, kind); err != nil {
 			return err
 		}
 		if err := os.MkdirAll(sub, 0o755); err != nil {
+			return err
+		}
+		if err := c.ensureKind(kind); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
+func (c *thumbCache) ensureKind(kind string) error {
+	top := strings.Split(filepath.Clean(kind), string(filepath.Separator))[0]
+	if top != cacheKindThumb && top != cacheKindPreview {
+		return errors.New("缓存种类无效")
+	}
+	dir := filepath.Join(c.rootFn(), top)
+	return safeio.ClaimCache(dir, c.trusted == nil || c.trusted(dir))
+}
+
 // writeFileAtomic tmp + rename 原子写，避免读到半截文件。
 func writeFileAtomic(path string, b []byte) error {
+	if err := safeio.CheckPath(path); err != nil {
+		return err
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return err
 	}
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		// SVC-20 + CODE-003：Windows 上 rename 到已存在/被占用目标会失败。
-		// 判据按失败原因收窄——仅"目标已存在/共享冲突"类错误视为并发写入者
-		// 已完成同 key 内容（等价成功）；权限/磁盘等其他错误原样返回，
-		// 避免 dst 恰为历史旧文件时误报成功。
-		if isConcurrentWriteErr(err) {
-			_ = os.Remove(tmp)
-			return nil
-		}
-		_ = os.Remove(tmp)
-		return err
-	}
-	return nil
+	return safeio.WriteFile(path, b, 0o600)
 }
 
 // isConcurrentWriteErr 判定 rename 失败是否属于"并发写入者已占据目标"类错误：
@@ -142,4 +156,34 @@ func isConcurrentWriteErr(err error) bool {
 		}
 	}
 	return false
+}
+
+// InvalidateWrites prevents fetches started before shutdown from recreating
+// cache files after a confirmed cleanup. It keeps existing cache files intact.
+func (c *thumbCache) InvalidateWrites() { c.mu.Lock(); c.epoch++; c.mu.Unlock() }
+
+func readCacheFile(path string, limit int64) ([]byte, error) {
+	if err := safeio.CheckPath(path); err != nil {
+		return nil, err
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		return nil, err
+	}
+	if !st.Mode().IsRegular() || st.Size() > limit {
+		return nil, errors.New("缓存文件类型或大小无效")
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	b, err := io.ReadAll(io.LimitReader(f, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) > limit {
+		return nil, errors.New("缓存文件过大")
+	}
+	return b, nil
 }

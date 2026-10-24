@@ -60,12 +60,13 @@
       <template #item="{ item }">
         <div
           class="dialog-row"
-          :class="{ active: item.id === selectedId }"
+          :class="{ active: item.id === selectedId && item.type === selectedType }"
           role="button"
           @click="emit('select', item)"
+          @contextmenu="onRowContextMenu($event, item)"
         >
-          <div class="dialog-avatar" :class="`t-${item.type}`">
-            <i :class="typeIcon(item.type)" />
+          <div class="dialog-avatar" :class="isSavedMessages(item) ? 't-saved' : `t-${item.type}`">
+            <i :class="isSavedMessages(item) ? 'pi pi-bookmark' : typeIcon(item.type)" />
           </div>
           <div class="dialog-main">
             <div class="dialog-line">
@@ -73,7 +74,7 @@
               <span class="dialog-time">{{ fmtShortTime(item.lastMessageAt) }}</span>
             </div>
             <div class="dialog-line">
-              <span class="dialog-sub">{{ item.username ? '@' + item.username : typeLabel(item.type) }}</span>
+              <span class="dialog-sub">{{ isSavedMessages(item) ? '我的收藏' : (item.username ? '@' + item.username : typeLabel(item.type)) }}</span>
               <Badge v-if="item.unreadCount" :value="item.unreadCount" size="small" />
             </div>
           </div>
@@ -91,6 +92,7 @@
       </template>
     </div>
     <div class="dialog-count">{{ filteredDialogs.length }} / {{ chats.dialogs.length }} 个对话</div>
+    <ContextMenu ref="contextMenuRef" :model="contextMenuItems" />
   </aside>
 </template>
 
@@ -102,6 +104,7 @@ import Button from 'primevue/button'
 import Message from 'primevue/message'
 import SelectButton from 'primevue/selectbutton'
 import VirtualScroller from 'primevue/virtualscroller'
+import ContextMenu from 'primevue/contextmenu'
 
 import SearchBox from './SearchBox.vue'
 import type { DialogView } from '../types'
@@ -111,10 +114,70 @@ import { useChatsStore } from '../stores/chats'
 
 defineProps<{
   selectedId: number | null
+  selectedType: string
 }>()
 const emit = defineEmits<{
   select: [DialogView]
+  'export-all': [DialogView]
+  manifest: [DialogView]
 }>()
+
+const contextMenuRef = ref()
+const activeDialog = ref<DialogView | null>(null)
+
+function onRowContextMenu(event: MouseEvent, item: DialogView) {
+  event.preventDefault()
+  activeDialog.value = item
+  contextMenuRef.value?.show(event)
+}
+
+const contextMenuItems = computed(() => [
+  {label:'已下载清单',icon:'pi pi-list',command:()=>{if(activeDialog.value) emit('manifest',activeDialog.value)}},
+  {
+    label: activeDialog.value ? `下载「${activeDialog.value.title}」全部媒体` : '下载全部媒体',
+    icon: 'pi pi-cloud-download',
+    command: () => {
+      if (activeDialog.value) {
+        emit('export-all', activeDialog.value)
+      }
+    },
+  },
+  {
+    label: '浏览此对话',
+    icon: 'pi pi-folder-open',
+    command: () => {
+      if (activeDialog.value) {
+        emit('select', activeDialog.value)
+      }
+    },
+  },
+  {
+    separator: true,
+  },
+  {
+    label: '复制对话名称',
+    icon: 'pi pi-copy',
+    command: () => {
+      if (activeDialog.value) {
+        void copyText(activeDialog.value.title)
+      }
+    },
+  },
+  {
+    label: '复制对话 ID',
+    icon: 'pi pi-hashtag',
+    command: () => {
+      if (activeDialog.value) {
+        void copyText(String(activeDialog.value.id))
+      }
+    },
+  },
+])
+
+async function copyText(value: string) {
+  try { await navigator.clipboard.writeText(value); toast.add({ severity: 'success', summary: '已复制', life: 2000 }) }
+  catch (e) { toast.add({ severity: 'error', summary: '复制失败', detail: String(e), life: 4000 }) }
+}
 
 const auth = useAuthStore()
 const chats = useChatsStore()
@@ -125,6 +188,10 @@ const useRegex = ref(false)
 const caseSensitive = ref(false)
 const typeFilter = ref<'all' | 'private' | 'group' | 'channel'>('all')
 const sortBy = ref<'recent' | 'title'>('recent')
+
+function isSavedMessages(item: DialogView): boolean {
+  return item.type === 'private' && item.isSelf === true
+}
 
 const typeFilterOptions = [
   { label: '全部', value: 'all' },
@@ -147,7 +214,7 @@ const regexInvalid = computed(() => useRegex.value && search.value.trim() !== ''
 const filteredDialogs = computed(() => {
   let list = chats.dialogs
   if (typeFilter.value !== 'all') {
-    list = list.filter((d) => d.type === typeFilter.value)
+    list = list.filter((d) => d.type === typeFilter.value || (typeFilter.value === 'group' && d.type === 'supergroup'))
   }
 
   const q = search.value.trim()
@@ -165,9 +232,19 @@ const filteredDialogs = computed(() => {
 
   const sorted = [...list]
   if (sortBy.value === 'recent') {
-    sorted.sort((a, b) => (b.lastMessageAt ?? 0) - (a.lastMessageAt ?? 0))
+    sorted.sort((a, b) => {
+      const aSaved = isSavedMessages(a) ? 1 : 0
+      const bSaved = isSavedMessages(b) ? 1 : 0
+      if (aSaved !== bSaved) return bSaved - aSaved
+      return (b.lastMessageAt ?? 0) - (a.lastMessageAt ?? 0)
+    })
   } else {
-    sorted.sort((a, b) => a.title.localeCompare(b.title, 'zh'))
+    sorted.sort((a, b) => {
+      const aSaved = isSavedMessages(a) ? 1 : 0
+      const bSaved = isSavedMessages(b) ? 1 : 0
+      if (aSaved !== bSaved) return bSaved - aSaved
+      return a.title.localeCompare(b.title, 'zh')
+    })
   }
   return sorted
 })
@@ -186,8 +263,9 @@ onMounted(() => {
 
 // 登录状态变化：登录后自动加载，登出后清空（选中态/媒体由父组件负责）
 watch(
-  () => auth.loggedIn,
+  () => auth.userId,
   (v) => {
+    chats.reset()
     if (v) {
       refresh()
     } else {
@@ -227,9 +305,14 @@ watch(
 }
 
 .dialog-toolbar.filters {
+	flex-wrap: wrap;
   padding-bottom: 12px;
   border-bottom: 1px solid var(--p-surface-200);
 }
+
+.dialog-toolbar.filters :deep(.p-selectbutton) { flex: 1 0 100%; }
+.dialog-toolbar.filters :deep(.p-togglebutton) { flex: 1; white-space: nowrap; }
+.dialog-toolbar .grow { min-width: 0; }
 
 .app-dark .dialog-toolbar.filters {
   border-bottom-color: var(--p-surface-700);
@@ -292,10 +375,15 @@ watch(
   color: var(--p-primary-contrast-color);
 }
 
+.dialog-avatar.t-saved {
+  background: var(--p-primary-color, var(--p-blue-500));
+}
+
 .dialog-avatar.t-private {
   background: var(--p-green-400);
 }
 
+.dialog-avatar.t-supergroup,
 .dialog-avatar.t-group {
   background: var(--p-blue-400);
 }

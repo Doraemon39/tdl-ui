@@ -86,3 +86,13 @@ func TestTimeLayoutPrecision(t *testing.T) {
 		t.Fatalf("时间格式精度错误: %s", TimeLayout)
 	}
 }
+func TestYAMLWithoutDirectoryStaysInsideSelectedDataBoundary(t *testing.T) {
+	dir := t.TempDir()
+	s, err := ParseYAML([]byte("level: warn\n"), dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.Dir != dir {
+		t.Fatal("partial YAML redirected logs outside the selected directory")
+	}
+}

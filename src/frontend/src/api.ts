@@ -31,6 +31,13 @@ export const Auth = {
 
 // ---- DownloadService ----
 export const Download = {
+ compareLocalMedia: DownloadService.CompareLocalMedia,
+ reviewLocalMedia: DownloadService.ReviewLocalMedia,
+ exportReviewedManifest: DownloadService.ExportReviewedManifest,
+ previewDownload: DownloadService.PreviewDownload,
+ newDownloadManifest: DownloadService.NewDownloadManifest,
+ readManifest: DownloadService.ReadManifest,
+ chooseManifest: DownloadService.ChooseManifest,
   createTask: DownloadService.CreateTask,
   listTasks: DownloadService.ListTasks,
   pauseTask: DownloadService.PauseTask,
@@ -46,6 +53,7 @@ export const Download = {
   listDownloadedMessages: DownloadService.ListDownloadedMessages,
   openDownloadedFile: DownloadService.OpenDownloadedFile,
   redownloadFile: DownloadService.RedownloadFile,
+  redownloadFiles: DownloadService.RedownloadFiles,
   deleteFileRecord: DownloadService.DeleteFileRecord,
   revealFile: DownloadService.RevealFileInDir,
   resumeTaskWithPending: DownloadService.ResumeTaskWithPending,
@@ -70,6 +78,9 @@ export const SettingsApi = {
   get: SettingsService.Get,
   save: SettingsService.Save,
   dataDir: SettingsService.DataDir,
+  isPortable: SettingsService.IsPortable,
+  openDataDir: SettingsService.OpenDataDir,
+  quitApp: SettingsService.QuitApp,
   clearCache: SettingsService.ClearCache,
   recentDirs: SettingsService.RecentDirs,
   addRecentDir: SettingsService.AddRecentDir,
@@ -106,11 +117,11 @@ export const LogApi = {
 
 // ---- 媒体图 HTTP 通道（后端 assetserver Handler，浏览器接管并发与缓存） ----
 export function thumbURL(dialogId: number, dialogType: string, messageId: number): string {
-  return `/media/thumb?d=${dialogId}&m=${messageId}&t=${encodeURIComponent(dialogType)}`
+  return `/media/thumb?v=2&d=${dialogId}&m=${messageId}&t=${encodeURIComponent(dialogType)}`
 }
 
 export function previewURL(dialogId: number, dialogType: string, messageId: number): string {
-  return `/media/preview?d=${dialogId}&m=${messageId}&t=${encodeURIComponent(dialogType)}`
+  return `/media/preview?v=2&d=${dialogId}&m=${messageId}&t=${encodeURIComponent(dialogType)}`
 }
 
 /** 在线视频分段流（后端按 Range 从 Telegram 拉取，未下载时使用）。 */
@@ -119,11 +130,12 @@ export function videoStreamURL(dialogId: number, dialogType: string, messageId: 
 }
 
 /** 已下载文件字节流（http.ServeContent，原生 Range/seek，零 API 消耗）。 */
-export function localMediaURL(dialogId: number, messageId: number): string {
-  return `/media/local?d=${dialogId}&m=${messageId}`
+export function localMediaURL(dialogId: number,messageId: number,dialogType: string): string {
+  return `/media/local?d=${dialogId}&m=${messageId}&t=${encodeURIComponent(dialogType)}`
 }
 
 // ---- 事件契约（与 internal/events/events.go 一致） ----
+export const EVENT_APP_BEFORE_CLOSE = 'app:before_close'
 export const EVENT_LOGIN = 'login:update'
 export const EVENT_TASK = 'task:update'
 export const EVENT_TASK_FILE = 'task:file'

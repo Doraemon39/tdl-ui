@@ -14,7 +14,7 @@ func TestDeleteFilesPathValidation(t *testing.T) {
 	}
 
 	m := NewManager(Deps{})
-	task := &Task{ID: "t1", mgr: m, status: StatusDone, files: []TaskFile{
+	task := &Task{ID: "t1", mgr: m, opts: TaskOptions{Dir: dir}, status: StatusDone, files: []TaskFile{
 		{Name: "a.bin", Path: real, Size: 1, State: "done"},
 	}}
 	m.tasks["t1"] = task

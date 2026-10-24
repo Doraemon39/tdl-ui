@@ -16,7 +16,7 @@ import (
 var logMedia = logging.L("media")
 
 // LocalPathFunc 解析某条消息已下载完成的本地文件路径；未下载时第二返回值为 false。
-type LocalPathFunc func(dialogID int64, messageID int) (string, bool)
+type LocalPathFunc func(dialogID int64, messageID int, dialogType string) (string, bool)
 
 // NewMediaHandler 媒体字节服务（挂载于 Wails assetserver 的兜底 Handler）：
 //
@@ -49,7 +49,7 @@ func mediaParams(w http.ResponseWriter, r *http.Request) (dialogID int64, msgID 
 	q := r.URL.Query()
 	dialogID, _ = strconv.ParseInt(q.Get("d"), 10, 64)
 	msgID, _ = strconv.Atoi(q.Get("m"))
-	if dialogID == 0 || msgID == 0 {
+	if dialogID <= 0 || msgID <= 0 || int64(msgID) > 2147483647 {
 		http.Error(w, "缺少 d/m 参数", http.StatusBadRequest)
 		return 0, 0, false
 	}
@@ -75,7 +75,7 @@ func serveMediaImage(s *ChatService, w http.ResponseWriter, r *http.Request, pre
 	}
 
 	w.Header().Set("Content-Type", "image/jpeg")
-	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	w.Header().Set("Cache-Control", "no-store")
 	_, _ = w.Write(b)
 }
 
@@ -91,7 +91,7 @@ func serveLocalMedia(localPath LocalPathFunc, w http.ResponseWriter, r *http.Req
 		return
 	}
 
-	p, ok := localPath(dialogID, msgID)
+	p, ok := localPath(dialogID, msgID, r.URL.Query().Get("t"))
 	if !ok || p == "" {
 		http.NotFound(w, r)
 		return

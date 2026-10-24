@@ -2,6 +2,8 @@ import { defineStore } from 'pinia'
 import { Chat } from '../api'
 import type { DialogView } from '../types'
 
+let generation = 0
+
 /** 对话列表（私聊 / 群组 / 频道），进入对话页时按需加载。 */
 export const useChatsStore = defineStore('chats', {
   state: () => ({
@@ -18,24 +20,30 @@ export const useChatsStore = defineStore('chats', {
     },
     /** 重新拉取对话列表；错误记录到 error 并重新抛出，由页面 toast。 */
     async refresh() {
+      const requestGeneration = generation
       this.loading = true
       this.error = ''
       try {
-        this.dialogs = (await Chat.listDialogs()) ?? []
+        const dialogs = (await Chat.listDialogs()) ?? []
+        if (requestGeneration !== generation) return
+        this.dialogs = dialogs
         this.loaded = true
       } catch (e: any) {
+        if (requestGeneration !== generation) return
         this.error = String(e?.message ?? e)
         throw e
       } finally {
-        this.loading = false
+        if (requestGeneration === generation) this.loading = false
       }
     },
     /** 按 ID 查找对话（详情页标题兜底）。 */
-    byId(id: number): DialogView | undefined {
-      return this.dialogs.find((d) => d.id === id)
+    byId(id: number, typ?: string): DialogView | undefined {
+      return this.dialogs.find((d) => d.id === id && (!typ || d.type === typ))
     },
     /** 登出后清空缓存。 */
     reset() {
+      generation++
+      this.loading = false
       this.dialogs = []
       this.loaded = false
       this.error = ''

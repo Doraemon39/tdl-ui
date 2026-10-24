@@ -1,3 +1,4 @@
+import { clearMediaSnapshots } from '../composables/useMediaPager'
 import { defineStore } from 'pinia'
 import { Auth, EVENT_LOGIN, on } from '../api'
 import type { LoginUpdate, LoginUser } from '../types'
@@ -68,6 +69,7 @@ export const useAuthStore = defineStore('auth', {
           this.qrUrl = ''
           break
         case 'logout':
+          clearMediaSnapshots()
           this.loggedIn = false
           this.userId = 0
           this.username = ''
@@ -80,6 +82,7 @@ export const useAuthStore = defineStore('auth', {
     applyUser(user?: LoginUser) {
       this.loggedIn = true
       if (user) {
+        if (this.userId !== user.id) clearMediaSnapshots()
         this.userId = user.id
         this.username = user.username
         this.name = user.name

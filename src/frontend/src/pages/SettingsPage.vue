@@ -56,12 +56,8 @@
       <h2 class="section-title">下载</h2>
       <div class="form-field">
         <label for="dl-dir">默认下载目录</label>
-        <DirSelect id="dl-dir" ref="dlDirSelect" v-model="store.settings.downloadDir" kind="download" />
-      </div>
-      <div class="form-field">
-        <label for="tpl">默认命名模板（Go text/template，与 tdl 兼容）</label>
-        <InputText id="tpl" v-model="store.settings.template" spellcheck="false" />
-        <span class="hint">可用变量：DialogID、MessageID、MessageDate、FileName、FileCaption、FileSize；函数：filenamify 等</span>
+        <DirSelect id="dl-dir" ref="dlDirSelect" v-model="store.settings.downloadDir" kind="download" placeholder="请选择或输入下载目录" />
+        <span class="hint">默认使用 Telegram 原始文件名。遇到同名文件将自动追加编号保存，不覆盖已有文件。</span>
       </div>
       <div class="num-row">
         <div class="form-field">
@@ -108,19 +104,33 @@
         </div>
       </div>
 
-      <h2 class="section-title">存储</h2>
+      <h2 class="section-title">存储与便携</h2>
       <div class="form-field">
-        <label>数据目录</label>
-        <span class="hint mono">{{ store.dataDir || '—' }}</span>
+        <div class="storage-title-row">
+          <label>数据目录</label>
+          <Tag :value="store.isPortable ? '便携数据目录' : '指定或兼容数据目录'" severity="info" />
+        </div>
+        <div class="data-dir-row">
+          <span class="hint mono grow">{{ store.dataDir || '—' }}</span>
+          <Button
+            label="打开目录"
+            icon="pi pi-folder-open"
+            size="small"
+            severity="secondary"
+            outlined
+            @click="onOpenDataDir"
+          />
+        </div>
+        <span class="hint">应用会话、任务库与默认缓存集中存放在此目录。自定义存储目录按上方设置生效。</span>
       </div>
       <div class="form-field">
         <label for="cache-dir">缓存目录</label>
-        <DirSelect id="cache-dir" ref="cacheDirSelect" v-model="store.settings.cacheDir" kind="cache" />
+        <DirSelect id="cache-dir" ref="cacheDirSelect" v-model="store.settings.cacheDir" kind="cache" placeholder="留空使用默认缓存目录" />
         <span class="hint">缩略图与预览缓存的存放位置，保存后立即生效</span>
       </div>
       <div class="form-field">
         <label for="temp-dir">视频临时目录</label>
-        <DirSelect id="temp-dir" ref="tempDirSelect" v-model="store.settings.tempDir" kind="temp" />
+        <DirSelect id="temp-dir" ref="tempDirSelect" v-model="store.settings.tempDir" kind="temp" placeholder="留空使用默认暂存目录" />
         <span class="hint">在线视频边下边播的分段暂存位置，上限 2GB 自动清理，保存后立即生效</span>
       </div>
       <div class="form-field">
@@ -130,7 +140,32 @@
         </div>
         <span class="hint">删除缓存目录下的缩略图、预览文件与视频临时分段，不影响已下载的内容</span>
       </div>
+      <div class="form-field">
+        <label>关闭窗口时的行为</label>
+        <div class="proxy-mode-options">
+          <label class="proxy-mode-option">
+            <RadioButton v-model="store.settings.exitAction" value="prompt" />
+            每次询问（默认）
+          </label>
+          <label class="proxy-mode-option">
+            <RadioButton v-model="store.settings.exitAction" value="direct" />
+            直接退出
+          </label>
+          <label class="proxy-mode-option">
+            <RadioButton v-model="store.settings.exitAction" value="clean_cache" />
+            清理默认缓存后退出
+          </label>
+        </div>
+        <span class="hint">退出时仅清理默认目录内的缩略图、预览和视频分段，自定义目录保留；可在退出弹窗中更改此项。</span>
+      </div>
 
+      <div class="danger-box">
+        <div class="danger-info">
+          <div class="danger-title">重置应用数据</div>
+          <div class="hint">清空登录会话、配置及任务记录，重置为未登录状态（已下载文件不受影响）</div>
+        </div>
+        <Button label="清除应用数据并退出…" severity="danger" outlined @click="store.exitChoice = 'wipe_all'; store.exitRequested = true" />
+      </div>
       <h2 class="section-title">日志</h2>
       <div class="form-field">
         <label>输出目标</label>
@@ -155,8 +190,8 @@
       </div>
       <div class="form-field">
         <label for="log-dir">日志目录</label>
-        <DirSelect id="log-dir" ref="logDirSelect" v-model="store.settings.log.dir" kind="logDir" />
-        <span class="hint">默认为程序目录下的 logs 子目录</span>
+        <DirSelect id="log-dir" ref="logDirSelect" v-model="store.settings.log.dir" kind="logDir" placeholder="留空使用默认日志目录" />
+        <span class="hint">默认为应用数据目录下的 logs 子目录</span>
       </div>
       <div class="form-field">
         <label for="log-fmt">格式模板</label>
@@ -205,6 +240,7 @@ import InputNumber from 'primevue/inputnumber'
 import InputText from 'primevue/inputtext'
 import RadioButton from 'primevue/radiobutton'
 import SelectButton from 'primevue/selectbutton'
+import Tag from 'primevue/tag'
 import ToggleSwitch from 'primevue/toggleswitch'
 
 import DirSelect from '../components/DirSelect.vue'
@@ -258,6 +294,14 @@ const logLevelOptions = [
 
 function onTheme(mode: ThemeMode) {
   store.applyTheme(mode)
+}
+
+async function onOpenDataDir() {
+  try {
+    await store.openDataDir()
+  } catch (e: any) {
+    toast.add({ severity: 'error', summary: '打开目录失败', detail: String(e), life: 4000 })
+  }
 }
 
 function onClearCache() {
@@ -366,5 +410,53 @@ async function save() {
   display: flex;
   justify-content: flex-end;
   margin-top: 24px;
+}
+
+.storage-title-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.data-dir-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.data-dir-row .grow {
+  flex: 1;
+}
+
+.danger-box {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 16px;
+  margin-top: 18px;
+  border: 1px dashed var(--p-red-300);
+  border-radius: 8px;
+  background: var(--p-red-50);
+}
+
+.app-dark .danger-box {
+  border-color: var(--p-red-800);
+  background: var(--p-red-950);
+}
+
+.danger-info {
+  flex: 1;
+}
+
+.danger-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--p-red-700);
+  margin-bottom: 2px;
+}
+
+.app-dark .danger-title {
+  color: var(--p-red-400);
 }
 </style>

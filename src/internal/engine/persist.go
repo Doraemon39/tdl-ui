@@ -77,6 +77,27 @@ func (m *Manager) loadFromStore() {
 			failed:    st.Failed,
 			files:     storeFilesToTaskFiles(files),
 		}
+		if st.DownloadOptions != "" {
+			var opts outputOptions
+			if err := json.Unmarshal([]byte(st.DownloadOptions), &opts); err != nil {
+				t.status = StatusFailed
+				t.errMsg = "下载策略记录损坏，拒绝恢复"
+			} else {
+				t.opts.ManifestPath = opts.ManifestPath
+				t.opts.ManifestMode = opts.ManifestMode
+				t.opts.RecordManifest = opts.RecordManifest
+				t.opts.AccountID = opts.AccountID
+				t.opts.ConflictAction = opts.Action
+				t.opts.ConflictCheck = opts.Check
+				t.opts.TargetNames = opts.Targets
+				t.opts.OverwriteKeys = opts.OverwriteKeys
+			}
+		}
+		for _, f := range t.files {
+			if f.State == "skipped" {
+				t.skipped++
+			}
+		}
 		m.tasks[t.ID] = t
 		m.order = append(m.order, t.ID)
 	}
@@ -123,22 +144,23 @@ func optionsToItems(opts TaskOptions) []store.Item {
 // toStoreTask 把任务主字段转为 store.Task 行。
 func toStoreTask(t *Task) store.Task {
 	return store.Task{
-		ID:         t.ID,
-		Label:      t.opts.Label,
-		Dir:        t.opts.Dir,
-		ScriptName: t.opts.ScriptName,
-		ScriptSrc:  t.scriptSrc,
-		Template:   t.opts.Template,
-		Renames:    marshalRenames(t.opts.Renames),
-		RewriteExt: t.opts.RewriteExt,
-		SkipSame:   t.opts.SkipSame,
-		GroupMedia: t.opts.Group,
-		Status:     t.status,
-		Error:      t.errMsg,
-		Total:      t.total,
-		Finished:   t.finished,
-		Failed:     t.failed,
-		CreatedAt:  t.CreatedAt,
+		ID:              t.ID,
+		Label:           t.opts.Label,
+		Dir:             t.opts.Dir,
+		ScriptName:      t.opts.ScriptName,
+		ScriptSrc:       t.scriptSrc,
+		Template:        t.opts.Template,
+		Renames:         marshalRenames(t.opts.Renames),
+		DownloadOptions: marshalOutputOptions(t.opts),
+		RewriteExt:      t.opts.RewriteExt,
+		SkipSame:        t.opts.SkipSame,
+		GroupMedia:      t.opts.Group,
+		Status:          t.status,
+		Error:           t.errMsg,
+		Total:           t.total,
+		Finished:        t.finished,
+		Failed:          t.failed,
+		CreatedAt:       t.CreatedAt,
 	}
 }
 
@@ -171,7 +193,7 @@ func storeFilesToTaskFiles(files []store.File) []TaskFile {
 	out := make([]TaskFile, 0, len(files))
 	for _, f := range files {
 		out = append(out, TaskFile{Name: f.Name, Path: f.Path, Size: f.Size, State: f.State,
-			DialogID: f.DialogID, MessageID: f.MessageID})
+			DialogID: f.DialogID, MessageID: f.MessageID, OriginalName: f.OriginalName, Reason: f.Reason, DialogType: f.DialogType, AccountID: f.AccountID, SHA256: f.SHA256, MediaID: f.MediaID})
 	}
 	return out
 }
@@ -202,4 +224,20 @@ func (t *Task) saveResumeKey(key string) {
 	if err := t.mgr.deps.Store.AddFinished(context.Background(), t.ID, key); err != nil {
 		logStoreErr(err, "保存断点失败: id=%s err=%v", t.ID, err)
 	}
+}
+
+type outputOptions struct {
+	OverwriteKeys  map[string]bool   `json:"overwriteKeys,omitempty"`
+	ManifestPath   string            `json:"manifestPath,omitempty"`
+	ManifestMode   string            `json:"manifestMode,omitempty"`
+	RecordManifest bool              `json:"recordManifest,omitempty"`
+	AccountID      int64             `json:"accountId,omitempty"`
+	Action         string            `json:"action"`
+	Check          string            `json:"check"`
+	Targets        map[string]string `json:"targets,omitempty"`
+}
+
+func marshalOutputOptions(opts TaskOptions) string {
+	b, _ := json.Marshal(outputOptions{OverwriteKeys: opts.OverwriteKeys, ManifestPath: opts.ManifestPath, ManifestMode: "completed", RecordManifest: opts.RecordManifest, AccountID: opts.AccountID, Action: opts.ConflictAction, Check: opts.ConflictCheck, Targets: opts.TargetNames})
+	return string(b)
 }

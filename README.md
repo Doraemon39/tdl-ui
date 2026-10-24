@@ -23,6 +23,8 @@ tdl UI 是对命令行工具 tdl 的 GUI 化改造：复用其经过验证的下
 - **代理支持**：SOCKS5 / HTTP 代理
 - **简约界面**：亮 / 暗 / 跟随系统三主题，localStorage 持久化，单一二进制免安装
 
+便携存储、媒体全选、批量重下及清理范围说明见 [本次修改与验证记录](doc/audit/2026-10-25-patch-hardening.md)。Windows 可在 `src/` 运行 `./build.ps1` 使用项目内构建工具。
+
 ## 界面预览
 
 > （截图占位：登录页 / 对话页 / 下载页 / 脚本页 / 设置页）
@@ -37,7 +39,7 @@ tdl UI 是对命令行工具 tdl 的 GUI 化改造：复用其经过验证的下
 
 ### 从源码构建
 
-环境要求：Go 1.25+、Node.js 20+、pnpm、[Wails CLI v2](https://wails.io/docs/gettingstarted/installation)。
+环境要求：Go 1.26+（建议使用当前安全修订版）、Node.js 20+、pnpm、[Wails CLI v2](https://wails.io/docs/gettingstarted/installation)。Windows 推荐运行 `src/build.ps1`，使用项目锁定的构建工具。
 
 ```bash
 git clone --recurse-submodules <本仓库地址>
@@ -82,3 +84,5 @@ wails build -ldflags "-s -w" -trimpath
 本项目复用了 [tdl](https://github.com/GitHubNull/tdl) 的代码（Git 子模块 + `go.mod replace` 引用），依其协议以 [AGPL-3.0](LICENSE) 发布。
 
 使用前请阅读[免责声明](DISCLAIMER.md)：本工具仅限合法用途，请遵守 Telegram 服务条款与当地法律法规。
+
+已下载清单只导出本地确认匹配项，重名默认排除；普通下载按原名比对，无法确认的重名自动编号保存。使用流程见[下载教程](doc/tutorials/intermediate/01-download.md)。

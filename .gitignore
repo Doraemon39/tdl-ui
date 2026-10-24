@@ -3,6 +3,7 @@ tmp/
 
 # Go 构建产物
 src/build/bin/
+src/.tools/
 *.exe
 *.syso
 
@@ -10,6 +11,9 @@ src/build/bin/
 node_modules/
 src/frontend/dist/
 src/frontend/wailsjs/
+
+# Wails frontend installation cache (regenerated from package.json)
+src/frontend/package.json.md5
 
 # pnpm
 .pnpm-store/
@@ -25,3 +29,6 @@ src/frontend/wailsjs/
 # 操作系统
 Thumbs.db
 .DS_Store
+
+# Portable application data (contains private sessions)
+tdl-ui-data/

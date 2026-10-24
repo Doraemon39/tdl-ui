@@ -127,14 +127,14 @@ func (s *LogService) ImportYAMLConfig() (logging.LogSettings, error) {
 		logLog.Errorf("读取 YAML 配置失败: %v", err)
 		return logging.LogSettings{}, err
 	}
-	parsed, err := logging.ParseYAML(b)
+	parsed, err := logging.ParseYAML(b, s.cfg.Get().Log.Dir)
 	if err != nil {
 		logLog.Errorf("解析 YAML 配置失败: %v", err)
 		return logging.LogSettings{}, errors.Wrap(err, "YAML 解析失败")
 	}
 	settings := s.cfg.Get()
 	settings.Log = parsed
-	if err := s.cfg.Update(settings); err != nil {
+	if err := s.cfg.UpdatePreferences(settings); err != nil {
 		return logging.LogSettings{}, err
 	}
 	logging.Reconfigure(parsed)

@@ -12,9 +12,10 @@ import (
 
 // 对话类型（与 ref/tdl/app/chat 一致），services 层复用。
 const (
-	DialogPrivate = "private"
-	DialogGroup   = "group"
-	DialogChannel = "channel"
+	DialogPrivate    = "private"
+	DialogGroup      = "group"
+	DialogSupergroup = "supergroup"
+	DialogChannel    = "channel"
 )
 
 // Selection 按「对话 + 消息 ID 集合」直接指定下载内容，
@@ -27,42 +28,55 @@ type Selection struct {
 
 // ResolveDialogPeer 按对话类型解析输入 peer（依赖对话列表落盘的 access hash）。
 func ResolveDialogPeer(ctx context.Context, manager *peers.Manager, id int64, typ string) (tg.InputPeerClass, error) {
+	if manager == nil || id <= 0 {
+		return nil, errors.New("无效对话")
+	}
 	switch typ {
 	case DialogPrivate:
-		if u, err := manager.ResolveUserID(ctx, id); err == nil {
-			return u.InputPeer(), nil
+		self, err := manager.Self(ctx)
+		if err != nil {
+			return nil, err
 		}
-	case DialogChannel:
-		if ch, err := manager.ResolveChannelID(ctx, id); err == nil {
-			return ch.InputPeer(), nil
+		if self.ID() == id {
+			return &tg.InputPeerSelf{}, nil
 		}
-	case DialogGroup:
-		if ch, err := manager.ResolveChannelID(ctx, id); err == nil {
-			return ch.InputPeer(), nil
+		u, err := manager.ResolveUserID(ctx, id)
+		if err != nil {
+			return nil, err
 		}
-		if c, err := manager.ResolveChatID(ctx, id); err == nil {
-			return c.InputPeer(), nil
-		}
-	}
-
-	// 兜底：依次尝试各类型
-	if ch, err := manager.ResolveChannelID(ctx, id); err == nil {
-		return ch.InputPeer(), nil
-	}
-	if u, err := manager.ResolveUserID(ctx, id); err == nil {
 		return u.InputPeer(), nil
-	}
-	if c, err := manager.ResolveChatID(ctx, id); err == nil {
+	case DialogChannel, DialogSupergroup:
+		ch, err := manager.ResolveChannelID(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		return ch.InputPeer(), nil
+	case DialogGroup:
+		c, err := manager.ResolveChatID(ctx, id)
+		if err != nil {
+			return nil, err
+		}
 		return c.InputPeer(), nil
+	default:
+		return nil, errors.New("缺少有效对话类型，请刷新对话列表")
 	}
-	return nil, errors.New("无法解析该对话，请回到对话列表刷新后重试")
 }
 
 // validateSelections 任务创建时的选集预检：格式错误立即反馈。
 func validateSelections(sels []Selection) error {
 	for _, sel := range sels {
-		if sel.DialogID == 0 {
+		if sel.DialogID <= 0 {
 			return errors.New("选集缺少对话 ID")
+		}
+		switch sel.DialogType {
+		case DialogPrivate, DialogGroup, DialogSupergroup, DialogChannel:
+		default:
+			return errors.New("选集对话类型无效")
+		}
+		for _, id := range sel.MessageIDs {
+			if id <= 0 || int64(id) > 2147483647 {
+				return errors.New("消息 ID 必须是正 int32")
+			}
 		}
 		if len(sel.MessageIDs) == 0 {
 			return errors.Errorf("对话 %d 的选集缺少消息 ID", sel.DialogID)
@@ -82,4 +96,17 @@ func selectionsToDialogs(ctx context.Context, manager *peers.Manager, sels []Sel
 		out = append(out, &tmessage.Dialog{Peer: p, Messages: sel.MessageIDs})
 	}
 	return out, nil
+}
+
+// PeerNamespace is the underlying MTProto peer class. Supergroups and channels
+// share a peer class; ordinary groups and users have separate ID spaces.
+func PeerNamespace(typ string) string {
+	switch typ {
+	case DialogPrivate, DialogGroup, DialogChannel:
+		return typ
+	case DialogSupergroup:
+		return DialogChannel
+	default:
+		return ""
+	}
 }

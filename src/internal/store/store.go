@@ -23,7 +23,7 @@ var logStore = logging.L("store")
 var ErrStoreClosed = errors.New("存储已关闭")
 
 // schemaVersion 当前数据库结构版本，配合 PRAGMA user_version 做手写迁移。
-const schemaVersion = 6
+const schemaVersion = 10
 
 // Store 封装单个 SQLite 连接（单进程单连接池，配合 WAL + busy_timeout 规避 Windows 锁竞争）。
 type Store struct {
@@ -34,10 +34,11 @@ type Store struct {
 
 // Task 任务主表行（对应 tasks 表）。
 type Task struct {
-	ID         string
-	Label      string
-	Dir        string
-	ScriptName string
+	DownloadOptions string
+	ID              string
+	Label           string
+	Dir             string
+	ScriptName      string
 	// ScriptSrc 任务创建时的脚本源码快照（SCR-04：恢复时优先用快照，
 	// 避免脚本文件事后被编辑导致同一任务前后两截规则不一致）
 	ScriptSrc  string
@@ -69,16 +70,22 @@ type Item struct {
 
 // File 任务内文件记录（对应 files 表）。
 type File struct {
-	ID        int64
-	TaskID    string
-	Name      string
-	Path      string
-	Size      int64
-	State     string // downloading / done / failed
-	DialogID  int64
-	MessageID int
-	CreatedAt string
-	UpdatedAt string
+	SHA256       string
+	MediaID      string
+	AccountID    int64
+	OriginalName string
+	Reason       string
+	DialogType   string
+	ID           int64
+	TaskID       string
+	Name         string
+	Path         string
+	Size         int64
+	State        string // downloading / done / failed
+	DialogID     int64
+	MessageID    int
+	CreatedAt    string
+	UpdatedAt    string
 }
 
 const (
@@ -168,6 +175,27 @@ func (s *Store) migrate() error {
 		}
 	}
 
+	if version < 7 {
+		if err := s.migrateV7(); err != nil {
+			return errors.Wrap(err, "迁移至 v7 失败")
+		}
+	}
+
+	if version < 8 {
+		if err := s.migrateV8(); err != nil {
+			return errors.Wrap(err, "迁移至 v8 失败")
+		}
+	}
+	if version < 9 {
+		if err := s.migrateV9(); err != nil {
+			return errors.Wrap(err, "迁移至 v9 失败")
+		}
+	}
+	if version < 10 {
+		if err := s.migrateV10(); err != nil {
+			return errors.Wrap(err, "迁移至 v10 失败")
+		}
+	}
 	logStore.Infof("数据库结构已就绪，版本=%d", schemaVersion)
 	return nil
 }
@@ -420,4 +448,72 @@ func boolToInt(b bool) int {
 		return 1
 	}
 	return 0
+}
+
+func (s *Store) migrateV7() error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, stmt := range []string{
+		`ALTER TABLE tasks ADD COLUMN download_options TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE files ADD COLUMN original_name TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE files ADD COLUMN reason TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE files ADD COLUMN dialog_type TEXT NOT NULL DEFAULT ''`,
+		`PRAGMA user_version = 7`,
+	} {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (s *Store) migrateV8() error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, stmt := range []string{
+		`ALTER TABLE files ADD COLUMN account_id INTEGER NOT NULL DEFAULT 0`,
+		`CREATE INDEX IF NOT EXISTS idx_files_owner_peer ON files(account_id,dialog_type,dialog_id,message_id,state)`,
+		`PRAGMA user_version = 8`,
+	} {
+		if _, err := tx.Exec(stmt); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+func (s *Store) migrateV9() error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`ALTER TABLE files ADD COLUMN media_id TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`PRAGMA user_version = 9`); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) migrateV10() error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`ALTER TABLE files ADD COLUMN sha256 TEXT NOT NULL DEFAULT ''`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`PRAGMA user_version = 10`); err != nil {
+		return err
+	}
+	return tx.Commit()
 }

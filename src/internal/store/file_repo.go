@@ -17,12 +17,12 @@ func (s *Store) UpsertFile(ctx context.Context, f File) error {
 		f.CreatedAt = now
 	}
 	_, err := s.db.ExecContext(ctx, `INSERT INTO files
-		(task_id, name, path, size, state, dialog_id, message_id, created_at, updated_at)
-		VALUES (?,?,?,?,?,?,?,?,?)
+		(task_id, name, path, size, state, dialog_id, message_id, original_name, reason, dialog_type, account_id, media_id, sha256, created_at, updated_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(task_id, path) DO UPDATE SET
 			name=excluded.name, size=excluded.size, state=excluded.state,
-			dialog_id=excluded.dialog_id, message_id=excluded.message_id, updated_at=excluded.updated_at`,
-		f.TaskID, f.Name, f.Path, f.Size, f.State, f.DialogID, f.MessageID, f.CreatedAt, now)
+			dialog_id=excluded.dialog_id, message_id=excluded.message_id, original_name=excluded.original_name, reason=excluded.reason, dialog_type=excluded.dialog_type, account_id=excluded.account_id, media_id=excluded.media_id, sha256=excluded.sha256, updated_at=excluded.updated_at`,
+		f.TaskID, f.Name, f.Path, f.Size, f.State, f.DialogID, f.MessageID, f.OriginalName, f.Reason, f.DialogType, f.AccountID, f.MediaID, f.SHA256, f.CreatedAt, now)
 	if err != nil {
 		return errors.Wrap(err, "写入文件记录失败")
 	}
@@ -51,18 +51,18 @@ func (s *Store) FinishFile(ctx context.Context, taskID, oldPath string, f File) 
 			return errors.Wrap(err, "清理最终路径旧行失败")
 		}
 	}
-	res, err := tx.ExecContext(ctx, `UPDATE files SET name=?, path=?, size=?, state=?, dialog_id=?, message_id=?, updated_at=?
+	res, err := tx.ExecContext(ctx, `UPDATE files SET name=?, path=?, size=?, state=?, dialog_id=?, message_id=?, original_name=?, reason=?, dialog_type=?, account_id=?, media_id=?, sha256=?, updated_at=?
 		WHERE task_id=? AND path=?`,
-		f.Name, f.Path, f.Size, f.State, f.DialogID, f.MessageID, now, taskID, oldPath)
+		f.Name, f.Path, f.Size, f.State, f.DialogID, f.MessageID, f.OriginalName, f.Reason, f.DialogType, f.AccountID, f.MediaID, f.SHA256, now, taskID, oldPath)
 	if err != nil {
 		return errors.Wrap(err, "改写文件记录失败")
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		// oldPath 行不存在（历史遗留），直接插入最终行。
 		if _, err := tx.ExecContext(ctx, `INSERT OR REPLACE INTO files
-			(task_id, name, path, size, state, dialog_id, message_id, created_at, updated_at)
-			VALUES (?,?,?,?,?,?,?,?,?)`,
-			taskID, f.Name, f.Path, f.Size, f.State, f.DialogID, f.MessageID, f.CreatedAt, now); err != nil {
+			(task_id, name, path, size, state, dialog_id, message_id, original_name, reason, dialog_type, account_id, media_id, sha256, created_at, updated_at)
+			VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+			taskID, f.Name, f.Path, f.Size, f.State, f.DialogID, f.MessageID, f.OriginalName, f.Reason, f.DialogType, f.AccountID, f.MediaID, f.SHA256, f.CreatedAt, now); err != nil {
 			return errors.Wrap(err, "插入最终文件记录失败")
 		}
 	}
@@ -90,7 +90,7 @@ func (s *Store) DropFile(ctx context.Context, taskID, path string) error {
 
 // ListFiles 返回任务的全部文件记录。
 func (s *Store) ListFiles(ctx context.Context, taskID string) ([]File, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, task_id, name, path, size, state, dialog_id, message_id, created_at, updated_at
+	rows, err := s.db.QueryContext(ctx, `SELECT id, task_id, name, path, size, state, dialog_id, message_id, original_name, reason, dialog_type, account_id, media_id, sha256, created_at, updated_at
 		FROM files WHERE task_id=? ORDER BY id ASC`, taskID)
 	if err != nil {
 		return nil, err
@@ -104,7 +104,7 @@ func (s *Store) ListFiles(ctx context.Context, taskID string) ([]File, error) {
 		var dialogID sql.NullInt64
 		var messageID sql.NullInt64
 		if err := rows.Scan(&f.ID, &f.TaskID, &f.Name, &f.Path, &size, &f.State,
-			&dialogID, &messageID, &f.CreatedAt, &f.UpdatedAt); err != nil {
+			&dialogID, &messageID, &f.OriginalName, &f.Reason, &f.DialogType, &f.AccountID, &f.MediaID, &f.SHA256, &f.CreatedAt, &f.UpdatedAt); err != nil {
 			return nil, err
 		}
 		f.Size = size.Int64
@@ -138,9 +138,9 @@ func (s *Store) DeleteFilesByPath(ctx context.Context, taskID string, paths []st
 
 // ListDoneFilesByDialog 返回对话内全部已完成的文件记录（"已下载"标记数据源）。
 // 按 updated_at 升序：同一 messageId 多次下载时，调用方后写覆盖即取到最新记录。
-func (s *Store) ListDoneFilesByDialog(ctx context.Context, dialogID int64) ([]File, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, task_id, name, path, size, state, dialog_id, message_id, created_at, updated_at
-		FROM files WHERE dialog_id=? AND message_id>0 AND state='done' ORDER BY updated_at ASC, id ASC`, dialogID)
+func (s *Store) ListDoneFilesByDialog(ctx context.Context, dialogID int64, typ string, accountID int64) ([]File, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, task_id, name, path, size, state, dialog_id, message_id, original_name, reason, dialog_type, account_id, media_id, sha256, created_at, updated_at
+		FROM files WHERE dialog_id=? AND dialog_type=? AND account_id=? AND message_id>0 AND state='done' ORDER BY updated_at ASC, id ASC`, dialogID, typ, accountID)
 	if err != nil {
 		return nil, err
 	}
@@ -158,9 +158,9 @@ func (s *Store) ListDoneFilesByDialog(ctx context.Context, dialogID int64) ([]Fi
 }
 
 // GetDoneFile 返回指定消息最新的已完成文件记录；无记录时第二返回值为 false。
-func (s *Store) GetDoneFile(ctx context.Context, dialogID int64, messageID int) (File, bool, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, task_id, name, path, size, state, dialog_id, message_id, created_at, updated_at
-		FROM files WHERE dialog_id=? AND message_id=? AND state='done' ORDER BY updated_at DESC, id DESC LIMIT 1`, dialogID, messageID)
+func (s *Store) GetDoneFile(ctx context.Context, dialogID int64, messageID int, typ string, accountID int64) (File, bool, error) {
+	row := s.db.QueryRowContext(ctx, `SELECT id, task_id, name, path, size, state, dialog_id, message_id, original_name, reason, dialog_type, account_id, media_id, sha256, created_at, updated_at
+		FROM files WHERE dialog_id=? AND message_id=? AND dialog_type=? AND account_id=? AND state='done' ORDER BY updated_at DESC, id DESC LIMIT 1`, dialogID, messageID, typ, accountID)
 	f, err := scanFile(row)
 	if errors.Is(err, sql.ErrNoRows) {
 		return File{}, false, nil
@@ -178,7 +178,7 @@ func scanFile(row interface{ Scan(...any) error }) (File, error) {
 	var dialogID sql.NullInt64
 	var messageID sql.NullInt64
 	if err := row.Scan(&f.ID, &f.TaskID, &f.Name, &f.Path, &size, &f.State,
-		&dialogID, &messageID, &f.CreatedAt, &f.UpdatedAt); err != nil {
+		&dialogID, &messageID, &f.OriginalName, &f.Reason, &f.DialogType, &f.AccountID, &f.MediaID, &f.SHA256, &f.CreatedAt, &f.UpdatedAt); err != nil {
 		return File{}, err
 	}
 	f.Size = size.Int64

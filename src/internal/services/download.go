@@ -2,6 +2,8 @@ package services
 
 import (
 	"os"
+	"path/filepath"
+	"sync"
 
 	"github.com/go-faster/errors"
 	"github.com/wailsapp/wails/v2/pkg/runtime"
@@ -16,9 +18,11 @@ var logDownload = logging.L("download")
 
 // DownloadService 下载任务管理。
 type DownloadService struct {
-	cfg     *config.Manager
-	manager *engine.Manager
-	emitter *events.Emitter
+	reviewsMu sync.Mutex
+	reviews   map[string]mediaReview
+	cfg       *config.Manager
+	manager   *engine.Manager
+	emitter   *events.Emitter
 }
 
 // NewDownloadService 创建下载服务。
@@ -75,8 +79,7 @@ func (s *DownloadService) ListTaskFiles(id string) ([]engine.TaskFile, error) {
 // ClearFinishedTasks 批量移除已完成任务记录（不删除文件）。
 func (s *DownloadService) ClearFinishedTasks() error {
 	logDownload.Infof("清除已完成任务记录")
-	s.manager.ClearFinished()
-	return nil
+	return s.manager.ClearFinished()
 }
 
 // DeleteTaskFiles 删除任务内指定文件；若任务文件全部删除则同步移除记录。
@@ -125,18 +128,34 @@ func (s *DownloadService) SelectDirectory(kind string, currentDir string) (strin
 		title = "选择临时目录"
 	case "logDir":
 		title = "选择日志目录"
+	case "manifest":
+		title = "选择媒体清单保存目录"
 	case "logExport":
 		title = "选择导出目录"
+	default:
+		return "", errors.New("目录用途无效")
 	}
-	defaultDir := s.cfg.Get().DownloadDir
+	var defaultDir string
 	if currentDir != "" {
 		defaultDir = currentDir
+	} else if recent := s.cfg.RecentDirs(kind); len(recent) > 0 {
+		defaultDir = recent[0]
 	} else {
-		recent := s.cfg.RecentDirs(kind)
-		if len(recent) > 0 {
-			defaultDir = recent[0]
+		switch kind {
+		case "download", "logExport", "manifest":
+			defaultDir = s.cfg.Get().DownloadDir
+		case "cache":
+			defaultDir = s.cfg.CacheDir()
+		case "temp":
+			defaultDir = s.cfg.TempDir()
+		case "logDir":
+			defaultDir = s.cfg.Get().Log.Dir
+		default:
+			return "", errors.New("目录用途无效")
 		}
 	}
+	defaultDir = existingDirectory(defaultDir)
+
 	picked, err := runtime.OpenDirectoryDialog(ctx, runtime.OpenDialogOptions{
 		Title:            title,
 		DefaultDirectory: defaultDir,
@@ -161,8 +180,8 @@ type DownloadedFile struct {
 
 // ListDownloadedMessages 返回对话内已下载完成且磁盘文件仍存在的消息列表；
 // 同一消息多次下载时保留最新记录。
-func (s *DownloadService) ListDownloadedMessages(dialogID int64) ([]DownloadedFile, error) {
-	files, err := s.manager.DownloadedFiles(dialogID)
+func (s *DownloadService) ListDownloadedMessages(dialogID int64, dialogType string) ([]DownloadedFile, error) {
+	files, err := s.manager.DownloadedFiles(dialogID, dialogType)
 	if err != nil {
 		logDownload.Errorf("查询已下载文件失败: dialog=%d err=%v", dialogID, err)
 		return nil, err
@@ -183,8 +202,8 @@ func (s *DownloadService) ListDownloadedMessages(dialogID int64) ([]DownloadedFi
 }
 
 // OpenDownloadedFile 用系统默认程序打开指定消息已下载的文件（双击打开入口）。
-func (s *DownloadService) OpenDownloadedFile(dialogID int64, messageID int) error {
-	f, ok, err := s.manager.DownloadedFile(dialogID, messageID)
+func (s *DownloadService) OpenDownloadedFile(dialogID int64, messageID int, dialogType string) error {
+	f, ok, err := s.manager.DownloadedFile(dialogID, messageID, dialogType)
 	if err != nil {
 		return err
 	}
@@ -242,4 +261,26 @@ func (s *DownloadService) ResumeTaskWithPending(id string) error {
 // GetTotalSpeed 返回全部活跃任务的聚合下载速度（字节/秒）。
 func (s *DownloadService) GetTotalSpeed() int64 {
 	return s.manager.TotalSpeed()
+}
+
+// existingDirectory finds an existing ancestor without creating directories
+// merely because the user opened (and possibly cancelled) the picker.
+func existingDirectory(dir string) string {
+	if !filepath.IsAbs(dir) {
+		return ""
+	}
+	for {
+		if st, err := os.Stat(dir); err == nil && st.IsDir() {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return ""
+		}
+		dir = parent
+	}
+}
+
+func (s *DownloadService) RedownloadFiles(taskID string, paths []string) error {
+	return s.manager.RedownloadFiles(taskID, paths)
 }

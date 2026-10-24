@@ -20,6 +20,8 @@ const (
 	ScriptLog = "script:log"
 	// Log 应用日志批量事件，payload 为 []logging.LogEntry
 	Log = "log:batch"
+	// AppBeforeClose 窗口即将关闭事件，通知前端弹出退出清理确认对话框
+	AppBeforeClose = "app:before_close"
 )
 
 // LoginUpdate 登录事件负载。

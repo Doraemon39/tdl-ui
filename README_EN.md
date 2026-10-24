@@ -37,7 +37,7 @@ Download `tdl-ui.exe` (Windows x64) from Releases and run it directly — no ins
 
 ### Build from source
 
-Requirements: Go 1.25+, Node.js 20+, pnpm, [Wails CLI v2](https://wails.io/docs/gettingstarted/installation).
+Requirements: Go 1.26+ (use a current security-patched toolchain), Node.js 20+, pnpm, [Wails CLI v2](https://wails.io/docs/gettingstarted/installation). On Windows, use `src/build.ps1` for the pinned project build tool.
 
 ```bash
 git clone --recurse-submodules <repo-url>
@@ -84,3 +84,8 @@ wails build -ldflags "-s -w" -trimpath
 This project reuses code from [tdl](https://github.com/GitHubNull/tdl) (as a Git submodule referenced via `go.mod replace`) and is therefore released under [AGPL-3.0](LICENSE).
 
 Please read the [disclaimer](DISCLAIMER.md) before use: this tool is for lawful purposes only; comply with the Telegram Terms of Service and your local laws.
+
+
+Portable storage, media selection, scoped re-downloads, and cleanup boundaries are documented in [the change and validation notes](doc/audit/2026-10-25-patch-hardening.md). On Windows, run `./build.ps1` from `src/` to use the project-local build tool.
+
+Downloaded manifests contain confirmed local matches only. Ambiguous duplicate names are excluded. Downloads use original filenames and preserve unconfirmed collisions with numbered suffixes. See the [download guide](doc/tutorials/intermediate/01-download.md).

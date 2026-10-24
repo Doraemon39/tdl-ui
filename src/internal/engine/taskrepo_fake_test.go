@@ -88,11 +88,11 @@ func (r *memRepo) ListFiles(_ context.Context, taskID string) ([]store.File, err
 
 func (r *memRepo) DeleteFilesByPath(_ context.Context, _ string, _ []string) error { return nil }
 
-func (r *memRepo) ListDoneFilesByDialog(_ context.Context, _ int64) ([]store.File, error) {
+func (r *memRepo) ListDoneFilesByDialog(_ context.Context, _ int64, _ string, _ int64) ([]store.File, error) {
 	return nil, nil
 }
 
-func (r *memRepo) GetDoneFile(_ context.Context, _ int64, _ int) (store.File, bool, error) {
+func (r *memRepo) GetDoneFile(_ context.Context, _ int64, _ int, _ string, _ int64) (store.File, bool, error) {
 	return store.File{}, false, nil
 }
 

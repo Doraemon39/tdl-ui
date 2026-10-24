@@ -45,6 +45,7 @@
     </main>
 
     <Toast position="bottom-right" />
+    <ExitConfirmDialog />
   </div>
 </template>
 
@@ -55,6 +56,7 @@ import Toast from 'primevue/toast'
 import ToggleSwitch from 'primevue/toggleswitch'
 
 import AppIcon from './components/AppIcon.vue'
+import ExitConfirmDialog from './components/ExitConfirmDialog.vue'
 import appIcon from './assets/app-icon.svg'
 import { router } from './router'
 import { isDark, themeMode } from './theme'

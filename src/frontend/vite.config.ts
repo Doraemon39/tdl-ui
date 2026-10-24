@@ -20,9 +20,19 @@ function media404(): Plugin {
   }
 }
 
+function localContentPolicy(): Plugin {
+  return {
+    name: 'local-content-policy',
+    apply: 'build',
+    transformIndexHtml() {
+      return [{ tag: 'meta', attrs: { 'http-equiv': 'Content-Security-Policy', content: "default-src 'self'; script-src 'self'; connect-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'; frame-src 'none'" }, injectTo: 'head-prepend' }]
+    },
+  }
+}
+
 // https://vitejs.dev/config/
 export default defineConfig({
-  plugins: [vue(), media404()],
+  plugins: [vue(), media404(), localContentPolicy()],
   define: {
     // 版本号单一事实来源：package.json（与 wails.json 同步维护）
     __APP_VERSION__: JSON.stringify(pkg.version),

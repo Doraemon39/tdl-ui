@@ -1,8 +1,12 @@
 // 类型单一事实来源为 wailsjs/go/models.ts（wails 生成，ARC-06/FE-03）；
 // 本文件仅做命名别名 + 补充 models.ts 没有的事件负载类型。
-import type { config, engine, logging, script, services } from '../wailsjs/go/models'
+import type { config, engine, logging, manifest, script, services } from '../wailsjs/go/models'
 
 // ---- 生成类型别名（保持既有前端命名，不重复维护字段） ----
+export type ManifestInfo = manifest.Info
+export type MediaComparison = manifest.Comparison
+export type MediaChoice = manifest.LocalChoice
+export type DownloadPreview = services.DownloadPreview
 export type Settings = config.Settings
 export type LogSettings = logging.LogSettings
 export type LogEntry = logging.LogEntry
@@ -41,6 +45,13 @@ export interface LoginUpdate {
 
 /** engine.FileEvent（task:file 事件负载） */
 export interface FileEvent {
+  date?: number
+  originalName?: string
+ mediaId?: string
+ manifestPath?: string
+ manifestError?: string
+  accountId?: number
+  dialogType?: string
   taskId: string
   fileId: number
   dialogId: number
@@ -48,7 +59,7 @@ export interface FileEvent {
   name: string
   total: number
   downloaded: number
-  state: 'downloading' | 'done' | 'failed'
+  state: 'downloading' | 'done' | 'failed' | 'skipped'
   error?: string
   /** 仅 done 时携带：最终文件路径 */
   path?: string

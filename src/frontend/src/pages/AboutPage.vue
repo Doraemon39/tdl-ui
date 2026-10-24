@@ -93,10 +93,10 @@ const REPO_URL = 'https://github.com/GitHubNull/tdl-ui'
 const version = __APP_VERSION__
 
 const techStack = [
-  { name: 'Go 1.25', desc: '后端服务与下载引擎' },
+  { name: 'Go 1.26+', desc: '后端服务与下载引擎' },
   { name: 'Wails v2.11', desc: '跨平台桌面框架' },
   { name: 'Vue 3.5 + TypeScript', desc: '前端框架' },
-  { name: 'PrimeVue 4.3（Aura）', desc: 'UI 组件库与主题' },
+  { name: 'PrimeVue 4.5（Aura）', desc: 'UI 组件库与主题' },
   { name: 'Yaegi v0.16', desc: 'Go 脚本沙箱引擎' },
   { name: 'tdl 上游引擎', desc: 'Telegram 下载与会话体系' },
   { name: 'modernc SQLite', desc: '任务与文件状态存储' },

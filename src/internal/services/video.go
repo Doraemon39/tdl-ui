@@ -42,10 +42,12 @@ var errNotVideo = errors.New("该消息没有可播放的视频")
 
 // videoMeta 播放所需的视频文档元信息。
 type videoMeta struct {
-	Size int64
-	MIME string
-	Name string
-	Loc  *tg.InputDocumentFileLocation
+	DialogType string
+	AccountID  int64
+	Size       int64
+	MIME       string
+	Name       string
+	Loc        *tg.InputDocumentFileLocation
 }
 
 // ---- 元信息与分段缓存 ----
@@ -156,10 +158,18 @@ func videoPartKey(dialogID int64, messageID int, partIdx int64) string {
 // VideoMeta 解析消息内视频文档的播放元信息（带 TTL 缓存）；
 // 消息不含视频时返回 errNotVideo。
 func (s *ChatService) VideoMeta(dialogID int64, dialogType string, messageID int) (videoMeta, error) {
-	if dialogID == 0 || messageID == 0 {
+	if dialogID <= 0 || messageID <= 0 || int64(messageID) > 2147483647 {
 		return videoMeta{}, errors.New("缺少对话或消息 ID")
 	}
-	key := videoKey(dialogID, messageID)
+	namespace := engine.PeerNamespace(dialogType)
+	if namespace == "" {
+		return videoMeta{}, errors.New("无效对话类型")
+	}
+	owner := s.cfg.Get().LoggedInUserID
+	if owner <= 0 {
+		return videoMeta{}, errNotLoggedIn
+	}
+	key := strconv.FormatInt(owner, 10) + ":" + namespace + ":" + videoKey(dialogID, messageID)
 	if m, ok := s.videos.getMeta(key); ok {
 		return m, nil
 	}
@@ -189,6 +199,8 @@ func (s *ChatService) VideoMeta(dialogID int64, dialogType string, messageID int
 		if !ok {
 			return errNotVideo
 		}
+		m.DialogType = namespace
+		m.AccountID = owner
 		out = m
 		return nil
 	})
@@ -196,6 +208,9 @@ func (s *ChatService) VideoMeta(dialogID int64, dialogType string, messageID int
 		return videoMeta{}, err
 	}
 
+	if owner != s.cfg.Get().LoggedInUserID {
+		return videoMeta{}, errors.New("视频所属会话已变更")
+	}
 	s.videos.putMeta(key, out)
 	return out, nil
 }
@@ -233,12 +248,15 @@ func videoMetaOf(msg *tg.Message) (videoMeta, bool) {
 // 拉取成功后同时回写两级缓存（重看/回拖免重复拉流）。
 // file_reference 失效时丢弃元信息缓存，使下次请求重新解析。
 func (s *ChatService) videoPart(ctx context.Context, dialogID int64, messageID int, meta videoMeta, partIdx int64) ([]byte, error) {
-	key := videoPartKey(dialogID, messageID, partIdx)
+	if s.cfg != nil && meta.AccountID != s.cfg.Get().LoggedInUserID {
+		return nil, errors.New("视频所属会话已变更")
+	}
+	key := videoCacheKey(meta, dialogID, messageID) + ":" + strconv.FormatInt(partIdx, 10)
 	if b, ok := s.videos.getPart(key); ok {
 		return b, nil
 	}
 	if s.videoDisk != nil {
-		if b, ok := s.videoDisk.get(dialogID, messageID, partIdx); ok {
+		if b, ok := s.videoDisk.get(dialogID, messageID, partIdx, videoDiskNamespace(meta)); ok {
 			s.videos.putPart(key, b) // 磁盘命中同步提升到内存，后续连续读免磁盘 IO
 			return b, nil
 		}
@@ -266,14 +284,17 @@ func (s *ChatService) videoPart(ctx context.Context, dialogID int64, messageID i
 	})
 	if err != nil {
 		if isFileRefExpired(err) {
-			s.videos.dropMeta(videoKey(dialogID, messageID))
+			s.videos.dropMeta(videoCacheKey(meta, dialogID, messageID))
 		}
 		return nil, err
 	}
 
+	if s.cfg != nil && meta.AccountID != s.cfg.Get().LoggedInUserID {
+		return nil, errors.New("视频所属会话已变更")
+	}
 	s.videos.putPart(key, out)
 	if s.videoDisk != nil {
-		s.videoDisk.put(dialogID, messageID, partIdx, out)
+		s.videoDisk.put(dialogID, messageID, partIdx, out, videoDiskNamespace(meta))
 	}
 	return out, nil
 }
@@ -310,7 +331,7 @@ func (s *ChatService) StopVideoPrefetch() {
 // startVideoPrefetch 从 fromPart 起后台顺序预取到文件末尾；
 // 同一视频重复触发不重启（seek 回拖依赖磁盘命中），切换视频时取消旧预取。
 func (s *ChatService) startVideoPrefetch(dialogID int64, messageID int, meta videoMeta, fromPart int64) {
-	key := videoKey(dialogID, messageID)
+	key := videoCacheKey(meta, dialogID, messageID)
 
 	s.prefetch.mu.Lock()
 	if s.prefetch.key == key && s.prefetch.cancel != nil {
@@ -339,10 +360,10 @@ func (s *ChatService) runVideoPrefetch(ctx context.Context, dialogID int64, mess
 			return
 		}
 		// 两级缓存已有的分段快进跳过，不占用拉取队列也不让步
-		if _, ok := s.videos.getPart(videoPartKey(dialogID, messageID, idx)); ok {
+		if _, ok := s.videos.getPart(videoCacheKey(meta, dialogID, messageID) + ":" + strconv.FormatInt(idx, 10)); ok {
 			continue
 		}
-		if s.videoDisk != nil && s.videoDisk.has(dialogID, messageID, idx) {
+		if s.videoDisk != nil && s.videoDisk.has(dialogID, messageID, idx, videoDiskNamespace(meta)) {
 			continue
 		}
 
@@ -471,4 +492,11 @@ func contentTypeFor(mimeType, name string) string {
 		return t
 	}
 	return "application/octet-stream"
+}
+
+func videoCacheKey(meta videoMeta, id int64, msg int) string {
+	if meta.DialogType == "" {
+		return videoKey(id, msg)
+	}
+	return strconv.FormatInt(meta.AccountID, 10) + ":" + meta.DialogType + ":" + videoKey(id, msg)
 }

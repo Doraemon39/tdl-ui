@@ -7,7 +7,7 @@
 
     <div class="split-body">
       <!-- 左面板：对话列表 -->
-      <DialogListPanel :selected-id="selectedId" @select="selectDialog" />
+      <DialogListPanel :selected-id="selectedId" :selected-type="selectedType" @select="selectDialog" @export-all="exportAllFromDialog" @manifest="openManifestForDialog" />
 
       <!-- 右面板：媒体内容 -->
       <section class="media-panel panel-card">
@@ -28,14 +28,17 @@
                 <Button label="清除" size="small" severity="secondary" text @click="clearSelection" />
               </template>
               <Button
-                v-else
-                label="全选本页"
+                label="全选结果"
+                icon="pi pi-check-circle"
                 size="small"
                 severity="secondary"
                 text
-                :disabled="!items.length"
-                @click="selectAllLoaded"
+                :loading="scanning"
+                @click="selectAllMedia()"
               />
+              <Button label="已下载清单" icon="pi pi-list" size="small" severity="secondary" text :disabled="!auth.loggedIn || !chats.loaded || !validDialogType(selectedType)" @click="manifestVisible = true" />
+              <Button label="下载整个对话" icon="pi pi-cloud-download" size="small" severity="secondary" text :loading="scanning" @click="downloadAllMedia" />
+              <Tag v-if="activeManifest" :value="`清单 ${activeManifest.info.total} 项`" severity="info" />
               <Button
                 label="下载选中"
                 icon="pi pi-download"
@@ -45,6 +48,13 @@
                 @click="downloadSelected"
               />
             </div>
+          </div>
+
+          <Message v-if="auth.loggedIn && !chats.loaded" severity="info" :closable="false">正在加载对话信息，准备就绪后将自动加载媒体。</Message>
+          <div v-if="scanning" class="scan-banner">
+            <i class="pi pi-spin pi-spinner" />
+            <span>正在扫描历史媒体… 已发现 {{ scannedCount }} 个</span>
+            <Button label="停止扫描" size="small" severity="danger" text @click="cancelScan" />
           </div>
 
           <MediaToolbar
@@ -77,6 +87,7 @@
                     :style="cardStyle(item)"
                     @click="toggleSelect(item, $event)"
                     @dblclick="onCardDblClick(item)"
+                    @contextmenu="onCardContextMenu($event, item)"
                     @mouseenter="onCardMouseEnter(item, $event)"
                     @mouseleave="onCardMouseLeave"
                     @mousemove="onCardMouseMove"
@@ -123,6 +134,7 @@
                         <i v-else class="pi pi-times" />
                         <template v-if="fileStateOf(item)!.state === 'downloading'">下载中 {{ fileStateOf(item)!.pct }}%</template>
                       </span>
+                      <span v-else-if="manifestExcluded(item)" class="dl-state manifest"><i class="pi pi-list" /> 清单已记录</span>
                       <span
                         v-else-if="downloadedMap.has(item.messageId)"
                         class="dl-state done"
@@ -171,6 +183,7 @@
                     :style="cardStyle(item)"
                     @click="toggleSelect(item, $event)"
                     @dblclick="onCardDblClick(item)"
+                    @contextmenu="onCardContextMenu($event, item)"
                     @mouseenter="onCardMouseEnter(item, $event)"
                     @mouseleave="onCardMouseLeave"
                     @mousemove="onCardMouseMove"
@@ -217,6 +230,7 @@
                         <i v-else class="pi pi-times" />
                         <template v-if="fileStateOf(item)!.state === 'downloading'">下载中 {{ fileStateOf(item)!.pct }}%</template>
                       </span>
+                      <span v-else-if="manifestExcluded(item)" class="dl-state manifest"><i class="pi pi-list" /> 清单已记录</span>
                       <span
                         v-else-if="downloadedMap.has(item.messageId)"
                         class="dl-state done"
@@ -281,7 +295,9 @@
       </section>
     </div>
 
-    <NewTaskDialog v-model:visible="dlVisible" :selection="dlSelection" @created="onTaskCreated" />
+    <ContextMenu ref="contextMenuRef" :model="contextMenuItems" />
+    <NewTaskDialog v-model:visible="dlVisible" :selection="dlSelection" :manifest="activeManifest" @manifest-change="setActiveManifest" @created="onTaskCreated" />
+    <MediaManifestDialog v-model:visible="manifestVisible" :dialog-id="selectedId ?? 0" :dialog-type="selectedType" :title="selectedTitle" :ready="auth.loggedIn && chats.loaded && validDialogType(selectedType)" :scanned-count="scannedCount" :active="activeManifest" :scan="scanForManifest" :cancel="cancelScan" @update:active="setActiveManifest" />
     <ConfirmDialog />
     <MediaPreview
       v-model:visible="previewVisible"
@@ -331,6 +347,7 @@ import { useConfirm } from 'primevue/useconfirm'
 import emptyChats from '../assets/illustrations/empty-chats.svg'
 import Button from 'primevue/button'
 import Checkbox from 'primevue/checkbox'
+import ContextMenu from 'primevue/contextmenu'
 import ConfirmDialog from 'primevue/confirmdialog'
 import Message from 'primevue/message'
 import Tag from 'primevue/tag'
@@ -340,10 +357,14 @@ import DialogListPanel from '../components/DialogListPanel.vue'
 import MediaPreview from '../components/MediaPreview.vue'
 import MediaToolbar from '../components/MediaToolbar.vue'
 import NewTaskDialog from '../components/NewTaskDialog.vue'
+import MediaManifestDialog from '../components/MediaManifestDialog.vue'
+import { manifestScopeMatches, manifestEntryMatches, type ManifestSelection } from '../utils/manifests'
+import type { ManifestInfo } from '../types'
 import VirtualScroll from '../components/VirtualScroll.vue'
-import { EVENT_TASK_FILE, on, thumbURL, Download } from '../api'
-import type { DialogView, FileEvent, MediaItem } from '../types'
-import { useMediaPager, type AppliedFilters } from '../composables/useMediaPager'
+import { EVENT_TASK, EVENT_TASK_FILE, on, thumbURL, Download } from '../api'
+import type { DialogView, FileEvent, MediaItem, TaskView } from '../types'
+import { peerNamespace } from '../utils/format'
+import { clearMediaSnapshots, useMediaPager, type AppliedFilters } from '../composables/useMediaPager'
 import { useWaterfall, gridVars, type MediaLayout } from '../composables/useWaterfall'
 import { useSmartImageLoader } from '../composables/useSmartImageLoader'
 import { usePerformanceMonitor } from '../utils/performance'
@@ -374,22 +395,31 @@ const { startTiming } = usePerformanceMonitor()
 // ---- 对话选中 ----
 
 const selectedId = ref<number | null>(null)
-const selectedDialog = computed(() => (selectedId.value ? chats.byId(selectedId.value) : undefined))
+const selectedPeerType = ref(String(route.query.type ?? ''))
+const selectedDialog = computed(() => {
+  const candidates = chats.dialogs.filter(d => d.id === selectedId.value)
+  return candidates.find(d => d.type === selectedPeerType.value) ?? (candidates.length === 1 ? candidates[0] : undefined)
+})
 // 深链兜底：store 未命中时回退路由 query 里的 type/title
-const selectedType = computed(() => selectedDialog.value?.type ?? String(route.query.type ?? ''))
+const selectedType = computed(() => selectedDialog.value?.type ?? selectedPeerType.value)
 const selectedTitle = computed(
   () => selectedDialog.value?.title ?? String(route.query.title ?? `对话 ${selectedId.value}`),
 )
 
 const LAST_DIALOG_KEY = 'chats.lastDialogId'
+const LAST_DIALOG_CONTEXT_KEY = 'chats.lastDialogContext'
+const validDialogType = (type: string) => ['private','group','supergroup','channel'].includes(type)
 
 function selectDialog(d: DialogView) {
-  if (selectedId.value === d.id) return
+  if (selectedId.value === d.id && selectedPeerType.value === d.type) return
+  selectedPeerType.value = d.type
   selectedId.value = d.id
   router.replace({ path: `/chats/${d.id}`, query: { type: d.type, title: d.title } })
 }
 
-watch(selectedId, (id) => {
+watch([selectedId, selectedType, () => auth.loggedIn, () => chats.loaded], ([id, type, loggedIn, dialogsReady]) => {
+  if (!loggedIn || !dialogsReady || !validDialogType(type)) { cancelScan(); switchTo(null); return }
+  if (activeManifest.value && !manifestScopeMatches(activeManifest.value.info,auth.userId,id ?? 0,type)) setActiveManifest(null)
   resetThumbClick() // FUNC-001：作废上一对话未决的单击延时与双击判定
   clearSelection()
   jumpMonth.value = null
@@ -413,6 +443,7 @@ watch(selectedId, (id) => {
   // 持久化最后选中对话
   if (id) {
     localStorage.setItem(LAST_DIALOG_KEY, String(id))
+    localStorage.setItem(LAST_DIALOG_CONTEXT_KEY, JSON.stringify({ id, type, accountId: auth.userId }))
   } else {
     localStorage.removeItem(LAST_DIALOG_KEY)
   }
@@ -432,13 +463,40 @@ const {
   applyFilters: pagerApplyFilters,
   jumpToDate,
   loadMore,
+  loadAll,
+  cancelScan,
+  scanning,
+  scannedCount,
 } = useMediaPager({
   dialogType: () => selectedType.value,
+  accountId: () => auth.userId,
+  ready: () => auth.loggedIn && chats.loaded,
   onError: (e: any) =>
     toast.add({ severity: 'error', summary: '加载媒体失败', detail: String(e?.message ?? e), life: 5000 }),
-  autoContinue: () => sentinelVisible && !restoring,
+  autoContinue: () => sentinelVisible && !restoring.value,
   scrollTop: () => scrollEl.value?.scrollTop ?? 0,
 })
+
+const manifestVisible = ref(false)
+const activeManifest = ref<ManifestSelection | null>(null)
+const manifestRecords = ref(new Map<number, ManifestInfo['entries'][number]>())
+function setActiveManifest(value: ManifestSelection | null) {
+  if (value && !manifestScopeMatches(value.info,auth.userId,selectedId.value ?? 0,selectedType.value)) {
+    toast.add({severity:'error',summary:'清单来源不匹配',detail:'请选择当前账号和当前对话的清单',life:5000}); return
+  }
+  activeManifest.value = value
+  manifestRecords.value = new Map((value?.info.entries ?? []).map(entry => [entry.messageId,entry]))
+}
+function manifestExcluded(item: MediaItem) {
+  const selection = activeManifest.value
+  return !!selection && manifestScopeMatches(selection.info,auth.userId,item.dialogId,selectedType.value) && manifestEntryMatches(item,manifestRecords.value.get(item.messageId),selection.mode)
+}
+async function scanForManifest() { return loadAll(true) }
+async function openManifestForDialog(dialog: DialogView) {
+  selectDialog(dialog)
+  await nextTick()
+  if (selectedId.value === dialog.id && selectedType.value === dialog.type) manifestVisible.value = true
+}
 
 function applyFilters(f: AppliedFilters) {
   // FE-20：重新查询从最新开始，同步清空月份跳转显示值（也使重选同一月可再次触发）
@@ -688,6 +746,7 @@ async function copyCaptionText() {
 // ---- 多选与下载 ----
 
 const selectedMsgs = ref(new Set<number>())
+
 /** 区间选择锚点：记录最近一次普通点击的 messageId，Shift+点击时以此为起点 */
 const lastClickedMsgId = ref<number | null>(null)
 
@@ -741,6 +800,82 @@ function toggleSelect(it: MediaItem, event?: MouseEvent) {
   lastClickedMsgId.value = it.messageId
 }
 
+const contextMenuRef = ref()
+const activeContextItem = ref<MediaItem | null>(null)
+
+function onCardContextMenu(event: MouseEvent, item: MediaItem) {
+  event.preventDefault()
+  activeContextItem.value = item
+  if (!selectedMsgs.value.has(item.messageId)) {
+    selectedMsgs.value = new Set([item.messageId])
+    lastClickedMsgId.value = item.messageId
+  }
+  contextMenuRef.value?.show(event)
+}
+
+const contextMenuItems = computed(() => [
+  {
+    label: selectedMsgs.value.size > 0 ? `下载选中项 (${selectedMsgs.value.size})` : '下载选中项',
+    icon: 'pi pi-download',
+    disabled: selectedMsgs.value.size === 0,
+    command: () => downloadSelected(),
+  },
+  {
+    label: '全选当前筛选结果',
+    icon: 'pi pi-check-circle',
+    command: () => selectAllMedia(),
+  },
+  {
+    label: '下载全部媒体',
+    icon: 'pi pi-cloud-download',
+    command: () => downloadAllMedia(),
+  },
+  {
+    separator: true,
+  },
+  {
+    label: '选择当前已加载项',
+    icon: 'pi pi-check-square',
+    disabled: items.value.length === 0,
+    command: () => selectAllLoaded(),
+  },
+  {
+    label: '清除选择',
+    icon: 'pi pi-times',
+    disabled: selectedMsgs.value.size === 0,
+    command: () => clearSelection(),
+  },
+])
+
+async function selectAllMedia(unfiltered = false): Promise<boolean> {
+  if (scanning.value) return false
+  const dialogId = selectedId.value
+  const dialogType = selectedType.value
+  const owner = auth.userId
+  const result = await loadAll(unfiltered)
+  if (result.status === 'limit') {
+    toast.add({ severity: 'warn', summary: '已达到单次扫描上限', detail: '已加载 100000 项，可下载已加载项；完整扫描未完成。', life: 6000 })
+  }
+  if (result.status !== 'complete' || selectedId.value !== dialogId || selectedType.value !== dialogType || auth.userId !== owner) return false
+  selectedMsgs.value = new Set(result.items.map(it => it.messageId))
+  toast.add({ severity: 'success', summary: '扫描完成', detail: `选中 ${result.items.length} 个符合条件的媒体文件`, life: 3000 })
+  return true
+}
+
+async function downloadAllMedia() {
+  if (!(await selectAllMedia(true))) return
+  if (selectedMsgs.value.size) downloadSelected()
+  else toast.add({ severity: 'info', summary: '未找到媒体文件', life: 3000 })
+}
+
+async function exportAllFromDialog(d: DialogView) {
+  if (scanning.value) return
+  selectDialog(d)
+  await nextTick()
+  if (selectedId.value !== d.id) return
+  await downloadAllMedia()
+}
+
 function selectAllLoaded() {
   selectedMsgs.value = new Set(items.value.map((it) => it.messageId))
 }
@@ -763,61 +898,8 @@ function openDownload(messageIds: number[]) {
   dlVisible.value = true
 }
 
-function downloadOne(it: MediaItem) {
-  if (isDownloading(it.messageId)) {
-    confirm.require({
-      header: '重复下载',
-      message: '该文件当前正在下载中，是否确认重复下载？',
-      icon: 'pi pi-exclamation-triangle',
-      acceptProps: { label: '重复下载' },
-      rejectProps: { label: '取消', severity: 'secondary', outlined: true },
-      accept: () => openDownload([it.messageId]),
-    })
-    return
-  }
-  if (downloadedMap.has(it.messageId)) {
-    confirm.require({
-      header: '重新下载',
-      message: '该文件已下载，是否重新下载？',
-      icon: 'pi pi-exclamation-triangle',
-      acceptProps: { label: '重新下载' },
-      rejectProps: { label: '取消', severity: 'secondary', outlined: true },
-      accept: () => openDownload([it.messageId]),
-    })
-    return
-  }
-  openDownload([it.messageId])
-}
-
-function downloadSelected() {
-  const ids = [...selectedMsgs.value]
-  const dlCount = ids.filter((id) => isDownloading(id)).length
-  const dupCount = ids.filter((id) => !isDownloading(id) && downloadedMap.has(id)).length
-  if (dlCount > 0) {
-    confirm.require({
-      header: '重复下载',
-      message: `选中文件中有 ${dlCount} 个正在下载中${dupCount > 0 ? `、${dupCount} 个已下载` : ''}，是否确认重复下载？`,
-      icon: 'pi pi-exclamation-triangle',
-      acceptProps: { label: '重复下载' },
-      rejectProps: { label: '取消', severity: 'secondary', outlined: true },
-      accept: () => openDownload(ids),
-    })
-    return
-  }
-  if (dupCount > 0) {
-    confirm.require({
-      header: '重新下载',
-      message: `选中文件中有 ${dupCount} 个已下载，是否重新下载？`,
-      icon: 'pi pi-exclamation-triangle',
-      acceptProps: { label: '重新下载' },
-      rejectProps: { label: '取消', severity: 'secondary', outlined: true },
-      accept: () => openDownload(ids),
-    })
-    return
-  }
-  openDownload(ids)
-}
-
+function downloadOne(it: MediaItem) { openDownload([it.messageId]) }
+function downloadSelected() { openDownload([...selectedMsgs.value]) }
 function onTaskCreated() {
   clearSelection()
   toast.add({ severity: 'success', summary: '下载任务已创建', detail: '可到「下载」页查看进度', life: 3000 })
@@ -834,8 +916,10 @@ async function refreshDownloaded(id: number | null) {
   downloadedMap.clear()
   if (!id || !auth.loggedIn) return
   try {
-    const list = await Download.listDownloadedMessages(id)
-    if (selectedId.value !== id) return // 返回时已切走，丢弃防串对话
+    const typ = selectedType.value
+    const owner = auth.userId
+    const list = await Download.listDownloadedMessages(id,typ)
+    if (selectedId.value !== id || selectedType.value !== typ || auth.userId !== owner) return // 返回时已切走，丢弃防串对话
     for (const f of list ?? []) downloadedMap.set(f.messageId, f.path)
   } catch {
     /* 非 Wails 环境或查询失败静默 */
@@ -846,7 +930,7 @@ async function refreshDownloaded(id: number | null) {
 async function openDownloaded(it: MediaItem) {
   if (!downloadedMap.has(it.messageId)) return
   try {
-    await Download.openDownloadedFile(it.dialogId, it.messageId)
+    await Download.openDownloadedFile(it.dialogId,it.messageId,selectedType.value)
   } catch (e: any) {
     // 磁盘文件已被删：同步摘掉标记，避免持续误导
     downloadedMap.delete(it.messageId)
@@ -898,6 +982,7 @@ const DONE_BADGE_TTL_MS = 5000
 
 const fileStates = reactive(new Map<string, { state: string; pct: number }>())
 let offTaskFile: (() => void) | null = null
+let offTaskState: (() => void) | null = null
 
 function fileStateOf(it: MediaItem) {
   return fileStates.get(itemKey(it))
@@ -906,10 +991,10 @@ function fileStateOf(it: MediaItem) {
 /** 判断当前对话某条消息是否正在下载中（角标状态优先，tasks store 兜底） */
 function isDownloading(messageId: number): boolean {
   if (!selectedId.value) return false
-  if (fileStates.get(`${selectedId.value}:${messageId}`)?.state === 'downloading') return true
+  if (fileStates.get(`${peerNamespace(selectedType.value)}:${selectedId.value}:${messageId}`)?.state === 'downloading') return true
   for (const byFile of Object.values(tasksStore.files)) {
     for (const ev of Object.values(byFile)) {
-      if (ev.dialogId === selectedId.value && ev.messageId === messageId && ev.state === 'downloading') return true
+      if (ev.accountId === auth.userId && peerNamespace(ev.dialogType ?? '') === peerNamespace(selectedType.value) && ev.dialogId === selectedId.value && ev.messageId === messageId && ev.state === 'downloading') return true
     }
   }
   return false
@@ -921,9 +1006,9 @@ function restoreFileStates() {
   if (!selectedId.value) return
   for (const byFile of Object.values(tasksStore.files)) {
     for (const ev of Object.values(byFile)) {
-      if (ev.dialogId !== selectedId.value || ev.state !== 'downloading') continue
+      if (ev.accountId !== auth.userId || peerNamespace(ev.dialogType ?? '') !== peerNamespace(selectedType.value) || ev.dialogId !== selectedId.value || ev.state !== 'downloading') continue
       const pct = ev.total > 0 ? Math.round((ev.downloaded / ev.total) * 100) : 0
-      fileStates.set(`${ev.dialogId}:${ev.messageId}`, { state: ev.state, pct })
+      fileStates.set(`${peerNamespace(ev.dialogType ?? '')}:${ev.dialogId}:${ev.messageId}`, { state: ev.state, pct })
     }
   }
 }
@@ -931,6 +1016,14 @@ function restoreFileStates() {
 // ---- 生命周期 ----
 
 onMounted(() => {
+  offTaskState = on<TaskView>(EVENT_TASK, async task => {
+    if (!['done','failed','paused','canceled'].includes(task.status) || !activeManifest.value) return
+    const path = activeManifest.value.info.path, owner = auth.userId, id = selectedId.value, typ = selectedType.value
+    try {
+      const info = await Download.readManifest(path)
+      if (owner === auth.userId && id === selectedId.value && typ === selectedType.value && activeManifest.value?.info.path === path) setActiveManifest({info})
+    } catch { /* explicit manifest controls report read failures */ }
+  })
   sentinelObserver = new IntersectionObserver(
     (entries) => {
       sentinelVisible = entries[0]?.isIntersecting ?? false
@@ -947,13 +1040,28 @@ onMounted(() => {
   window.addEventListener('resize', updateVirtualScrollContainerHeight)
 
   offTaskFile = on<FileEvent>(EVENT_TASK_FILE, (ev) => {
+    if (ev.accountId !== auth.userId) return
     if (!ev.dialogId || !ev.messageId) return
-    const key = `${ev.dialogId}:${ev.messageId}`
+    const key = `${peerNamespace(ev.dialogType ?? '')}:${ev.dialogId}:${ev.messageId}`
+    if (ev.state === 'skipped') { fileStates.delete(key); return }
+    if (ev.state === 'done' && ev.manifestPath && activeManifest.value && ev.manifestPath.toLowerCase() === activeManifest.value.info.path.toLowerCase()) {
+      if (ev.manifestError) {
+        toast.add({severity:'error',summary:'文件已保存，清单未更新',detail:ev.manifestError,life:7000})
+      } else if (ev.mediaId && manifestScopeMatches(activeManifest.value.info,auth.userId,ev.dialogId,ev.dialogType ?? '')) {
+        const info = activeManifest.value.info
+        const old = manifestRecords.value.get(ev.messageId)
+        if (!old || old.state !== 'done') info.done++
+        const record = {...old,messageId:ev.messageId,mediaId:ev.mediaId,name:ev.originalName ?? old?.name ?? ev.name,size:ev.total,date:ev.date ?? old?.date ?? 0,state:'done',savedName:ev.name,evidence:'source'}
+        manifestRecords.value.set(ev.messageId,record)
+        if (old) Object.assign(old,record)
+        else { info.entries.push(record); info.total++ }
+      }
+    }
     const pct = ev.total > 0 ? Math.round((ev.downloaded / ev.total) * 100) : 0
     fileStates.set(key, { state: ev.state, pct })
     if (ev.state === 'done') {
       // 完成即刻登记"已下载"，角标短暂展示后自然退化为常驻 chip
-      if (ev.dialogId === selectedId.value && ev.path) {
+      if (ev.accountId === auth.userId && peerNamespace(ev.dialogType ?? '') === peerNamespace(selectedType.value) && ev.dialogId === selectedId.value && ev.path) {
         downloadedMap.set(ev.messageId, ev.path)
       }
       // 完成角标短暂展示后移除，避免长会话下集合无限增长
@@ -963,35 +1071,51 @@ onMounted(() => {
     }
   })
 
-  // 深链 /chats/:id 预选对话
-  const pid = Number(route.params.id)
-  if (pid) {
-    selectedId.value = pid
-  } else {
-    const last = localStorage.getItem(LAST_DIALOG_KEY)
-    if (last) {
-      const lastId = Number(last)
-      selectedId.value = lastId
-      const d = chats.byId(lastId)
-      router.replace({ path: '/chats/' + lastId, query: { type: d?.type ?? '', title: d?.title ?? '' } })
-    }
-  }
+  restoreSelection()
+
 })
+
+function restoreSelection() {
+  if (!auth.loggedIn || selectedId.value) return
+  const pid = Number(route.params.id)
+  if (Number.isSafeInteger(pid) && pid > 0) {
+    selectedPeerType.value = String(route.query.type ?? '')
+    selectedId.value = pid
+    return
+  }
+  try {
+    const stored = JSON.parse(localStorage.getItem(LAST_DIALOG_CONTEXT_KEY) ?? 'null')
+    if (stored && typeof stored.accountId === 'number' && stored.accountId !== auth.userId) {
+      localStorage.removeItem(LAST_DIALOG_KEY);localStorage.removeItem(LAST_DIALOG_CONTEXT_KEY);return
+    }
+    if (stored?.accountId === auth.userId && Number.isSafeInteger(stored.id) && stored.id > 0 && validDialogType(stored.type)) {
+      selectedPeerType.value = stored.type; selectedId.value = stored.id
+      return
+    }
+  } catch { /* old or malformed local preference */ }
+  if (!chats.loaded) return
+  const lastId = Number(localStorage.getItem(LAST_DIALOG_KEY))
+  const candidates = chats.dialogs.filter(d => d.id === lastId)
+  if (candidates.length === 1) selectDialog(candidates[0])
+}
+watch(() => [auth.loggedIn, chats.loaded], restoreSelection)
 
 // 深链与历史前进后退：/chats/:id 变化时同步选中
 //（selectDialog 的 router.replace 因 id 相同不会回环触发）
 watch(
-  () => route.params.id,
-  (v) => {
+  () => [route.params.id, route.query.type],
+  ([v, typ]) => {
     const pid = Number(v)
-    if (pid && pid !== selectedId.value) selectedId.value = pid
+    if (pid) { selectedPeerType.value = String(typ ?? ''); selectedId.value = pid }
   },
 )
 
 onBeforeUnmount(() => {
+  cancelScan()
   saveSnapshot() // 离开页面保留当前对话浏览进度（LRU 缓存）
   sentinelObserver?.disconnect()
   offTaskFile?.()
+  offTaskState?.()
   resetThumbClick()
   onCardMouseLeave() // 清理悬停计时器与提示
   
@@ -1001,19 +1125,26 @@ onBeforeUnmount(() => {
 
 // 登出后清空选中与媒体（对话列表由 DialogListPanel 负责）
 watch(
-  () => auth.loggedIn,
-  (v) => {
-    if (!v) {
+  () => auth.userId,
+  (id, previous) => {
+    if (previous > 0 && id !== previous) {
       resetThumbClick() // FUNC-001：登出即上下文失效，未决点击一并作废
       onCardMouseLeave() // 清理悬停状态
+      cancelScan()
+      clearMediaSnapshots()
       selectedId.value = null
+      manifestVisible.value = false
+      setActiveManifest(null)
       localStorage.removeItem(LAST_DIALOG_KEY)
+      localStorage.removeItem(LAST_DIALOG_CONTEXT_KEY)
     }
   },
 )
 </script>
 
 <style scoped>
+.dl-state.manifest {background:var(--p-primary-color);color:var(--p-primary-contrast-color);}
+
 .mb-16 {
   margin-bottom: 16px;
 }
@@ -1408,6 +1539,23 @@ watch(
 
 <!-- 悬停 caption 预览提示样式：Teleport 到 body，不能用 scoped -->
 <style>
+.scan-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 16px;
+  background: var(--p-primary-50);
+  color: var(--p-primary-700);
+  font-size: 13px;
+  border-radius: 6px;
+  margin: 8px 16px 0;
+}
+
+.app-dark .scan-banner {
+  background: var(--p-primary-950);
+  color: var(--p-primary-300);
+}
+
 .caption-hover-tip {
   position: fixed;
   z-index: 1200;

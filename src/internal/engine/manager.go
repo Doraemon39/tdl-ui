@@ -5,8 +5,12 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"github.com/iyear/tdl/pkg/tplfunc"
 	"os"
+	"path/filepath"
+	"strings"
 	"sync"
+	"text/template"
 	"time"
 
 	"github.com/go-faster/errors"
@@ -15,6 +19,7 @@ import (
 
 	"tdl-ui/internal/config"
 	"tdl-ui/internal/events"
+	"tdl-ui/internal/manifest"
 	"tdl-ui/internal/script"
 	"tdl-ui/internal/store"
 )
@@ -36,8 +41,8 @@ type TaskRepo interface {
 	DropFile(ctx context.Context, taskID, path string) error
 	ListFiles(ctx context.Context, taskID string) ([]store.File, error)
 	DeleteFilesByPath(ctx context.Context, taskID string, paths []string) error
-	ListDoneFilesByDialog(ctx context.Context, dialogID int64) ([]store.File, error)
-	GetDoneFile(ctx context.Context, dialogID int64, messageID int) (store.File, bool, error)
+	ListDoneFilesByDialog(ctx context.Context, dialogID int64, typ string, accountID int64) ([]store.File, error)
+	GetDoneFile(ctx context.Context, dialogID int64, messageID int, typ string, accountID int64) (store.File, bool, error)
 	// 断点
 	LoadFinished(ctx context.Context, taskID string) (map[string]struct{}, error)
 	AddFinished(ctx context.Context, taskID, key string) error
@@ -57,7 +62,10 @@ type Deps struct {
 
 // Manager 任务管理器：维护任务列表并驱动执行。
 type Manager struct {
-	deps Deps
+	manifests *manifest.Registry
+	outputs   outputCoordinator
+	closing   bool
+	deps      Deps
 
 	// executor 单次任务执行函数，可注入以便测试；nil 时使用真实下载执行（execute）
 	executor func(ctx context.Context, t *Task) error
@@ -70,7 +78,7 @@ type Manager struct {
 // NewManager 创建任务管理器，并从 SQLite 恢复历史任务记录。
 func NewManager(deps Deps) *Manager {
 	m := &Manager{
-		deps:  deps,
+		deps: deps, manifests: manifest.NewRegistry(),
 		tasks: make(map[string]*Task),
 	}
 	m.loadFromStore()
@@ -87,6 +95,11 @@ func newTaskID() string {
 
 // Create 创建并启动下载任务，返回任务 ID。
 func (m *Manager) Create(opts TaskOptions) (string, error) {
+	release, err := m.deps.Cfg.UseSession()
+	if err != nil {
+		return "", err
+	}
+	defer release()
 	if len(opts.URLs) == 0 && len(opts.Selections) == 0 {
 		return "", errors.New("至少需要一条消息链接或一个选集")
 	}
@@ -101,10 +114,55 @@ func (m *Manager) Create(opts TaskOptions) (string, error) {
 		return "", err
 	}
 	if opts.Dir == "" {
+		if m.deps.Cfg == nil {
+			return "", errors.New("缺少下载目录")
+		}
 		opts.Dir = m.deps.Cfg.Get().DownloadDir
 	}
 	if opts.Template == "" {
-		opts.Template = m.deps.Cfg.Get().Template
+		opts.Template = config.DefaultTemplate
+		if m.deps.Cfg != nil {
+			opts.Template = m.deps.Cfg.Get().Template
+		}
+	}
+	if m.deps.Cfg != nil {
+		opts.AccountID = m.deps.Cfg.Get().LoggedInUserID
+		if opts.AccountID <= 0 {
+			return "", errors.New("请先登录当前账号")
+		}
+		if opts.ConflictAction == "" {
+			opts.ConflictAction = m.deps.Cfg.Get().ConflictAction
+		}
+	}
+	if opts.ManifestPath != "" {
+		if opts.ManifestMode == "" {
+			opts.ManifestMode = "completed"
+		}
+		if opts.ManifestMode != "all" && opts.ManifestMode != "completed" {
+			return "", errors.New("清单跳过模式无效")
+		}
+		if _, err := m.manifests.Open(opts.ManifestPath, opts.AccountID); err != nil {
+			return "", err
+		}
+	}
+	if err := normalizeTaskPolicies(&opts); err != nil {
+		return "", err
+	}
+	abs, err := filepath.Abs(opts.Dir)
+	if err != nil {
+		return "", err
+	}
+	opts.Dir = abs
+	if err := m.deps.Cfg.ValidateDownloadDir(opts.Dir); err != nil {
+		return "", err
+	}
+	if _, err := template.New("dl").Funcs(tplfunc.FuncMap(tplfunc.All...)).Parse(opts.Template); err != nil {
+		return "", errors.Wrap(err, "命名模板无效")
+	}
+	for _, name := range opts.TargetNames {
+		if _, err := cleanOutputName(name); err != nil {
+			return "", err
+		}
 	}
 	if err := os.MkdirAll(opts.Dir, 0o755); err != nil {
 		return "", errors.Wrap(err, "创建下载目录失败")
@@ -137,14 +195,19 @@ func (m *Manager) Create(opts TaskOptions) (string, error) {
 		status:    StatusQueued,
 	}
 
+	m.mu.Lock()
+	if m.closing {
+		m.mu.Unlock()
+		return "", errors.New("应用正在退出")
+	}
 	if m.deps.Store != nil {
 		// Manager 公开 API 无调用方 ctx，持久化统一用 Background（STO-03）。
 		if err := m.deps.Store.InsertTask(context.Background(), toStoreTask(t), optionsToItems(opts)); err != nil {
+			m.mu.Unlock()
 			return "", errors.Wrap(err, "保存任务失败")
 		}
 	}
 
-	m.mu.Lock()
 	m.tasks[t.ID] = t
 	m.order = append(m.order, t.ID)
 	m.mu.Unlock()
@@ -203,10 +266,25 @@ func (m *Manager) Resume(id string) error {
 		return err
 	}
 
+	if err := t.waitFinalization(); err != nil {
+		return err
+	}
 	t.mu.Lock()
+	if m.deps.Cfg != nil && t.opts.AccountID != m.deps.Cfg.Get().LoggedInUserID {
+		t.mu.Unlock()
+		return errors.New("任务属于其他账号或缺少账号归属，请从当前对话重新选择")
+	}
 	if t.removed { // 已被并发 Remove 移除，不得复活
 		t.mu.Unlock()
 		return errors.Errorf("任务不存在: %s", id)
+	}
+	if t.status == StatusRunning || t.status == StatusQueued {
+		t.mu.Unlock()
+		return errors.New("任务已在运行或排队中")
+	}
+	if t.runDone != nil {
+		t.mu.Unlock()
+		return errors.New("任务仍在收尾中，请稍后重试")
 	}
 	switch t.status {
 	case StatusPaused, StatusFailed, StatusCanceled:
@@ -272,8 +350,12 @@ func (m *Manager) Cancel(id string) error {
 
 // Remove 从列表中移除处于终态的任务。
 func (m *Manager) Remove(id string) error {
+	m.outputs.invalidateOrigins()
 	t, err := m.get(id)
 	if err != nil {
+		return err
+	}
+	if err := t.waitFinalization(); err != nil {
 		return err
 	}
 
@@ -287,6 +369,14 @@ func (m *Manager) Remove(id string) error {
 	if running {
 		return errors.New("请先暂停或取消运行中的任务")
 	}
+	if m.deps.Store != nil {
+		if err := m.deps.Store.DeleteTask(context.Background(), id); err != nil {
+			t.mu.Lock()
+			t.removed = false
+			t.mu.Unlock()
+			return err
+		}
+	}
 
 	m.mu.Lock()
 	delete(m.tasks, id)
@@ -297,11 +387,6 @@ func (m *Manager) Remove(id string) error {
 		}
 	}
 	m.mu.Unlock()
-	if m.deps.Store != nil {
-		if err := m.deps.Store.DeleteTask(context.Background(), id); err != nil {
-			logEngine.Errorf("删除任务记录失败: id=%s err=%v", id, err)
-		}
-	}
 	return nil
 }
 
@@ -328,59 +413,77 @@ func (m *Manager) TaskDir(id string) (string, error) {
 }
 
 // DownloadedFiles 返回对话内全部已完成的文件记录（跨任务，"已下载"标记数据源）。
-func (m *Manager) DownloadedFiles(dialogID int64) ([]store.File, error) {
+func (m *Manager) DownloadedFiles(dialogID int64, typ string) ([]store.File, error) {
+	if PeerNamespace(typ) == "" {
+		return nil, errors.New("对话类型无效")
+	}
 	if m.deps.Store == nil {
 		return nil, nil
 	}
-	return m.deps.Store.ListDoneFilesByDialog(context.Background(), dialogID)
+	return m.deps.Store.ListDoneFilesByDialog(context.Background(), dialogID, PeerNamespace(typ), m.deps.Cfg.Get().LoggedInUserID)
 }
 
 // DownloadedFile 返回指定消息最新的已完成文件记录；未下载过时第二返回值为 false。
-func (m *Manager) DownloadedFile(dialogID int64, messageID int) (store.File, bool, error) {
+func (m *Manager) DownloadedFile(dialogID int64, messageID int, typ string) (store.File, bool, error) {
+	if PeerNamespace(typ) == "" {
+		return store.File{}, false, errors.New("对话类型无效")
+	}
 	if m.deps.Store == nil {
 		return store.File{}, false, nil
 	}
-	return m.deps.Store.GetDoneFile(context.Background(), dialogID, messageID)
+	return m.deps.Store.GetDoneFile(context.Background(), dialogID, messageID, PeerNamespace(typ), m.deps.Cfg.Get().LoggedInUserID)
 }
 
 // ClearFinished 移除全部已完成状态的任务记录（不动磁盘文件）。
-func (m *Manager) ClearFinished() {
+func (m *Manager) ClearFinished() error {
+	m.outputs.invalidateOrigins()
 	m.mu.Lock()
-	var removed []string
+	var firstErr error
 	kept := m.order[:0]
 	for _, id := range m.order {
 		t := m.tasks[id]
 		t.mu.Lock()
-		done := t.status == StatusDone
+		done := t.status == StatusDone && t.runDone == nil
+		if done {
+			t.removed = true
+		}
 		t.mu.Unlock()
+		if done && m.deps.Store != nil {
+			if err := m.deps.Store.DeleteTask(context.Background(), id); err != nil {
+				if firstErr == nil {
+					firstErr = err
+				}
+				t.mu.Lock()
+				t.removed = false
+				t.mu.Unlock()
+				done = false
+			}
+		}
 		if done {
 			delete(m.tasks, id)
-			removed = append(removed, id)
 		} else {
 			kept = append(kept, id)
 		}
 	}
 	m.order = kept
 	m.mu.Unlock()
-	if m.deps.Store != nil {
-		for _, id := range removed {
-			if err := m.deps.Store.DeleteTask(context.Background(), id); err != nil {
-				logEngine.Errorf("清理任务记录失败: id=%s err=%v", id, err)
-			}
-		}
-	}
+	return firstErr
 }
 
 // DeleteFiles 删除任务内指定文件（paths 必须严格匹配记录内登记的路径，
 // 防止删除任意路径）；文件全部删光后整条任务记录一并移除。
 func (m *Manager) DeleteFiles(id string, paths []string) error {
+	m.outputs.invalidateOrigins()
 	t, err := m.get(id)
 	if err != nil {
 		return err
 	}
+	if err := t.waitFinalization(); err != nil {
+		return err
+	}
 
 	t.mu.Lock()
-	if t.status == StatusRunning || t.status == StatusQueued {
+	if t.status == StatusRunning || t.status == StatusQueued || t.runDone != nil {
 		t.mu.Unlock()
 		return errors.New("请先暂停或取消运行中的任务")
 	}
@@ -401,13 +504,17 @@ func (m *Manager) DeleteFiles(id string, paths []string) error {
 	}
 	var firstErr error
 	var deleted []string
-	kept := t.files[:0]
+	kept := make([]TaskFile, 0, len(t.files))
 	for _, f := range t.files {
 		if _, ok := toDelete[f.Path]; !ok {
 			kept = append(kept, f)
 			continue
 		}
-		if err := os.Remove(f.Path); err != nil && !os.IsNotExist(err) {
+		if f.State == "skipped" {
+			deleted = append(deleted, f.Path)
+			continue
+		}
+		if err := removeRegisteredFile(t.opts.Dir, f.Path); err != nil && !os.IsNotExist(err) {
 			if firstErr == nil {
 				firstErr = errors.Wrapf(err, "删除 %s 失败", f.Name)
 			}
@@ -416,8 +523,24 @@ func (m *Manager) DeleteFiles(id string, paths []string) error {
 		}
 		deleted = append(deleted, f.Path)
 	}
+	empty := len(kept) == 0
+	if m.deps.Store != nil {
+		var err error
+		if empty {
+			err = m.deps.Store.DeleteTask(context.Background(), id)
+		} else if len(deleted) > 0 {
+			err = m.deps.Store.DeleteFilesByPath(context.Background(), id, deleted)
+		}
+		if err != nil {
+			t.mu.Unlock()
+			return errors.Wrap(err, "文件删除已执行，但记录保存失败，请重试")
+		}
+	}
 	t.files = kept
-	empty := len(t.files) == 0
+	t.fileIndex = nil
+	if empty {
+		t.removed = true
+	}
 	t.mu.Unlock()
 
 	if empty {
@@ -431,84 +554,102 @@ func (m *Manager) DeleteFiles(id string, paths []string) error {
 		}
 		m.mu.Unlock()
 	}
-	if m.deps.Store != nil {
-		if empty {
-			_ = m.deps.Store.DeleteTask(context.Background(), id)
-		} else if len(deleted) > 0 {
-			_ = m.deps.Store.DeleteFilesByPath(context.Background(), id, deleted)
-		}
-	}
 	return firstErr
 }
 
-// RedownloadFile 重新下载任务中的单个文件。
-// 从断点中移除该文件的记录，重置文件状态，并在必要时重新启动任务执行。
+// RedownloadFile creates a separate task for exactly the selected source.
 func (m *Manager) RedownloadFile(taskID, filePath string) error {
+	return m.RedownloadFiles(taskID, []string{filePath})
+}
+
+// RedownloadFiles validates the entire request before creating a selection-only
+// task. The source task, its counters and resume points remain immutable.
+func (m *Manager) RedownloadFiles(taskID string, paths []string) error {
+	if len(paths) == 0 {
+		return errors.New("请选择要重新下载的文件")
+	}
 	t, err := m.get(taskID)
 	if err != nil {
 		return err
 	}
-
+	if err := t.waitFinalization(); err != nil {
+		return err
+	}
 	t.mu.Lock()
-	// 查找文件记录
-	var targetFile *TaskFile
-	for i := range t.files {
-		if t.files[i].Path == filePath {
-			targetFile = &t.files[i]
-			break
-		}
-	}
-	if targetFile == nil {
+	if t.removed || t.status == StatusQueued || t.status == StatusRunning || t.runDone != nil {
 		t.mu.Unlock()
-		return errors.New("文件不属于该任务")
+		return errors.New("请先暂停任务并等待下载停止")
 	}
-
-	// 从断点中移除（如果存在）
-	resumeKey := fmt.Sprintf("%d:%d", targetFile.DialogID, targetFile.MessageID)
-	if m.deps.Store != nil {
-		_ = m.deps.Store.DeleteResumeKey(context.Background(), taskID, resumeKey)
+	if m.deps.Cfg != nil && t.opts.AccountID != m.deps.Cfg.Get().LoggedInUserID {
+		t.mu.Unlock()
+		return errors.New("任务属于其他账号或缺少账号归属，请从当前对话重新选择")
 	}
-
-	// 重置文件状态
-	targetFile.State = "downloading"
-	// 注意：不清空 Path，因为下载器会复用该路径进行断点续传或重新下载
-
-	// 如果任务处于终态，重置任务状态以便重新执行
-	needRestart := false
-	if t.status == StatusDone || t.status == StatusFailed || t.status == StatusCanceled {
-		t.status = StatusQueued
-		t.errMsg = ""
-		// 减少已完成计数（如果该文件之前是完成状态）
-		if targetFile.State == "done" && t.finished > 0 {
-			t.finished--
+	byPath := make(map[string]TaskFile)
+	for _, f := range t.files {
+		byPath[f.Path] = f
+	}
+	opts := TaskOptions{Dir: t.opts.Dir, Template: t.opts.Template, ConflictAction: "overwrite", ConflictCheck: "target", TargetNames: make(map[string]string), OverwriteKeys: make(map[string]bool), Label: "重新下载"}
+	seen := make(map[string]bool)
+	for _, path := range paths {
+		f, ok := byPath[path]
+		if !ok || f.DialogID <= 0 || f.MessageID <= 0 {
+			t.mu.Unlock()
+			return errors.New("文件不属于该任务或缺少来源消息")
 		}
-		// 减少失败计数（如果该文件之前是失败状态）
-		if targetFile.State == "failed" && t.failed > 0 {
-			t.failed--
+		typ := f.DialogType
+		if typ == "" {
+			for _, sel := range t.opts.Selections {
+				if sel.DialogID == f.DialogID {
+					typ = sel.DialogType
+					break
+				}
+			}
 		}
-		needRestart = true
+		if typ == "" {
+			t.mu.Unlock()
+			return errors.New("旧记录缺少对话类型，请从对话媒体页重新选择下载")
+		}
+		key := resumeKey(f.DialogID, f.MessageID, typ)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		name := f.Name
+		if f.State == "done" {
+			name, err = filepath.Rel(t.opts.Dir, f.Path)
+			if err != nil {
+				t.mu.Unlock()
+				return err
+			}
+		}
+		if _, err := cleanOutputName(name); err != nil {
+			t.mu.Unlock()
+			return err
+		}
+		opts.TargetNames[key] = name
+		opts.OverwriteKeys[key] = f.State == "done"
+		opts.Selections = append(opts.Selections, Selection{DialogID: f.DialogID, DialogType: typ, MessageIDs: []int{f.MessageID}})
 	}
 	t.mu.Unlock()
-
-	// 如果任务被重置为排队状态，启动执行
-	if needRestart {
-		t.emitUpdate()
-		go m.run(t)
-	}
-
-	return nil
+	_, err = m.Create(opts)
+	return err
 }
 
 // DeleteFileRecord 仅删除文件记录（保留磁盘文件）。
 func (m *Manager) DeleteFileRecord(taskID, filePath string) error {
+	m.outputs.invalidateOrigins()
 	t, err := m.get(taskID)
 	if err != nil {
 		return err
 	}
 
 	t.mu.Lock()
+	if t.removed || t.status == StatusRunning || t.status == StatusQueued || t.runDone != nil {
+		t.mu.Unlock()
+		return errors.New("请先暂停并等待任务停止")
+	}
 	// 从内存列表移除
-	kept := t.files[:0]
+	kept := make([]TaskFile, 0, len(t.files))
 	found := false
 	for _, f := range t.files {
 		if f.Path == filePath {
@@ -517,17 +658,21 @@ func (m *Manager) DeleteFileRecord(taskID, filePath string) error {
 		}
 		kept = append(kept, f)
 	}
-	t.files = kept
-	t.mu.Unlock()
-
 	if !found {
+		t.mu.Unlock()
 		return errors.New("文件不属于该任务")
 	}
 
 	// 从数据库删除记录
 	if m.deps.Store != nil {
-		_ = m.deps.Store.DeleteFilesByPath(context.Background(), taskID, []string{filePath})
+		if err := m.deps.Store.DeleteFilesByPath(context.Background(), taskID, []string{filePath}); err != nil {
+			t.mu.Unlock()
+			return err
+		}
 	}
+	t.files = kept
+	t.fileIndex = nil
+	t.mu.Unlock()
 
 	return nil
 }
@@ -540,10 +685,25 @@ func (m *Manager) ResumeTaskWithPending(id string) error {
 		return err
 	}
 
+	if err := t.waitFinalization(); err != nil {
+		return err
+	}
 	t.mu.Lock()
+	if m.deps.Cfg != nil && t.opts.AccountID != m.deps.Cfg.Get().LoggedInUserID {
+		t.mu.Unlock()
+		return errors.New("任务属于其他账号或缺少账号归属，请从当前对话重新选择")
+	}
 	if t.removed {
 		t.mu.Unlock()
 		return errors.Errorf("任务不存在: %s", id)
+	}
+	if t.status == StatusRunning || t.status == StatusQueued {
+		t.mu.Unlock()
+		return errors.New("任务已在运行或排队中")
+	}
+	if t.runDone != nil {
+		t.mu.Unlock()
+		return errors.New("任务仍在收尾中，请稍后重试")
 	}
 
 	// 检查是否有未完成的文件
@@ -559,14 +719,34 @@ func (m *Manager) ResumeTaskWithPending(id string) error {
 		return errors.New("任务没有未完成的文件")
 	}
 
+	// Load scripts before mutating the task. A bad script must not leave an
+	// unstarted task queued forever.
+	if t.contracts == nil && t.opts.ScriptName != "" {
+		var c *script.Contracts
+		var err error
+		if t.scriptSrc != "" {
+			c, err = script.Load(t.scriptSrc)
+		} else {
+			c, err = m.deps.Scripts.LoadByName(t.opts.ScriptName)
+		}
+		if err != nil {
+			t.mu.Unlock()
+			return err
+		}
+		t.contracts = c
+	}
 	// 重置失败文件的状态为 downloading，让它们重新下载
 	for i := range t.files {
 		if t.files[i].State == "failed" {
 			t.files[i].State = "downloading"
-			// 从断点中移除失败文件的记录
-			resumeKey := fmt.Sprintf("%d:%d", t.files[i].DialogID, t.files[i].MessageID)
+			// 从断点中移除失败文件的记录（兼容带 peer 前缀与旧格式纯数字两套坐标）
+			keyWithPeer := resumeKey(t.files[i].DialogID, t.files[i].MessageID, t.files[i].DialogType)
+			legacyKey := fmt.Sprintf("%d:%d", t.files[i].DialogID, t.files[i].MessageID)
 			if m.deps.Store != nil {
-				_ = m.deps.Store.DeleteResumeKey(context.Background(), id, resumeKey)
+				_ = m.deps.Store.DeleteResumeKey(context.Background(), id, keyWithPeer)
+				if keyWithPeer != legacyKey {
+					_ = m.deps.Store.DeleteResumeKey(context.Background(), id, legacyKey)
+				}
 			}
 		}
 	}
@@ -610,36 +790,45 @@ func (m *Manager) ResumeTaskWithPending(id string) error {
 // DeleteAllFiles 停止全部任务，删除所有登记文件（含 .tmp 未完成文件），并清空全部记录。
 func (m *Manager) DeleteAllFiles() error {
 	m.mu.Lock()
-	snapshot := make([]*Task, 0, len(m.order))
-	for _, id := range m.order {
-		snapshot = append(snapshot, m.tasks[id])
+	snapshot := make([]*Task, 0, len(m.tasks))
+	for _, t := range m.tasks {
+		t.mu.Lock()
+		t.removed = true
+		t.mu.Unlock()
+		snapshot = append(snapshot, t)
 	}
-	// 先清空登记，迟到的 run() 会因任务不存在而直接退出
-	m.tasks = make(map[string]*Task)
-	m.order = nil
 	m.mu.Unlock()
-
-	for _, t := range snapshot {
-		t.stopWait(10 * time.Second)
-	}
-
 	var firstErr error
 	for _, t := range snapshot {
-		t.mu.Lock()
-		files := append([]TaskFile(nil), t.files...)
-		t.files = nil
-		t.mu.Unlock()
-		for _, f := range files {
-			if err := os.Remove(f.Path); err != nil && !os.IsNotExist(err) && firstErr == nil {
-				firstErr = errors.Wrapf(err, "删除 %s 失败", f.Name)
-			}
+		if !t.stopWait(10 * time.Second) {
+			firstErr = errors.New("等待下载停止超时，未删除文件")
 		}
 	}
-
-	if m.deps.Store != nil {
+	if firstErr != nil {
 		for _, t := range snapshot {
-			_ = m.deps.Store.DeleteTask(context.Background(), t.ID)
+			t.mu.Lock()
+			t.removed = false
+			t.mu.Unlock()
 		}
+		return firstErr
+	}
+	for _, t := range snapshot {
+		t.mu.Lock()
+		paths := make([]string, 0, len(t.files))
+		for _, f := range t.files {
+			paths = append(paths, f.Path)
+		}
+		t.mu.Unlock()
+		if len(paths) > 0 {
+			if err := m.DeleteFiles(t.ID, paths); err != nil && firstErr == nil {
+				firstErr = err
+			}
+		} else if err := m.Remove(t.ID); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		t.mu.Lock()
+		t.removed = false
+		t.mu.Unlock()
 	}
 	return firstErr
 }
@@ -650,7 +839,7 @@ func (m *Manager) HasActive() bool {
 	defer m.mu.Unlock()
 	for _, t := range m.tasks {
 		t.mu.Lock()
-		active := t.status == StatusRunning || t.status == StatusQueued
+		active := t.status == StatusRunning || t.status == StatusQueued || t.runDone != nil
 		t.mu.Unlock()
 		if active {
 			return true
@@ -680,8 +869,9 @@ func (m *Manager) TotalSpeed() int64 {
 
 // StopAndWait 以“暂停”语义停止全部运行中的任务并等待其 goroutine 退出（应用关闭编排用）。
 // 断点由 progress 实时持久化，任务落库为 paused，下次启动可断点续传。
-func (m *Manager) StopAndWait(timeout time.Duration) {
+func (m *Manager) StopAndWait(timeout time.Duration) bool {
 	m.mu.Lock()
+	m.closing = true
 	snapshot := make([]*Task, 0, len(m.order))
 	for _, id := range m.order {
 		snapshot = append(snapshot, m.tasks[id])
@@ -703,7 +893,7 @@ func (m *Manager) StopAndWait(timeout time.Duration) {
 		t.mu.Unlock()
 	}
 	if len(waits) == 0 {
-		return
+		return true
 	}
 
 	deadline := time.After(timeout)
@@ -712,10 +902,11 @@ func (m *Manager) StopAndWait(timeout time.Duration) {
 		case <-ch:
 		case <-deadline:
 			logEngine.Warnf("等待下载任务退出超时（%s），继续关闭流程", timeout)
-			return
+			return false
 		}
 	}
 	logEngine.Infof("全部下载任务已停止")
+	return true
 }
 
 // exists 任务是否仍在管理器中（删除全部文件时用于阻断迟到的 run）。
@@ -729,9 +920,108 @@ func (m *Manager) exists(id string) bool {
 func (m *Manager) get(id string) (*Task, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.closing {
+		return nil, errors.New("应用正在退出")
+	}
 	t, ok := m.tasks[id]
 	if !ok {
 		return nil, errors.Errorf("任务不存在: %s", id)
 	}
 	return t, nil
 }
+
+func normalizeTaskPolicies(opts *TaskOptions) error {
+	if opts.ManifestPath != "" {
+		if opts.ManifestMode == "" {
+			opts.ManifestMode = "completed"
+		}
+		if opts.ManifestMode != "all" && opts.ManifestMode != "completed" {
+			return errors.New("清单跳过模式无效")
+		}
+	} else if opts.RecordManifest {
+		return errors.New("缺少用于记录完成结果的清单")
+	}
+
+	// Preserve the meaning of old callers' skipSame=false (overwrite).
+	if opts.ConflictAction == "" {
+		if opts.SkipSame {
+			opts.ConflictAction = "skip"
+		} else {
+			opts.ConflictAction = "overwrite"
+		}
+	}
+	switch opts.ConflictAction {
+	case "skip", "overwrite", "rename", "smart":
+	default:
+		return errors.New("同名策略无效")
+	}
+	if opts.ConflictCheck == "" {
+		opts.ConflictCheck = "origin"
+	}
+	switch opts.ConflictCheck {
+	case "target", "origin":
+	default:
+		return errors.New("同名判定依据无效")
+	}
+	opts.SkipSame = opts.ConflictAction == "skip" || opts.ConflictAction == "smart"
+	if opts.ConflictAction == "skip" {
+		opts.ConflictAction = "smart"
+		opts.ConflictCheck = "origin"
+	}
+	if opts.ManifestPath != "" {
+		opts.ManifestMode = "completed"
+		opts.RecordManifest = true
+	}
+	return nil
+}
+
+func removeRegisteredFile(dir, path string) error {
+	rel, err := filepath.Rel(dir, path)
+	if err != nil || !filepath.IsLocal(rel) || rel == "." {
+		return errors.New("登记路径超出下载目录，拒绝删除")
+	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	st, err := root.Lstat(rel)
+	if err != nil {
+		return err
+	}
+	if !st.Mode().IsRegular() {
+		return errors.New("拒绝删除非普通文件")
+	}
+	return root.Remove(rel)
+}
+
+func (m *Manager) knownOrigins(dir string) (map[string]string, error) {
+	out := make(map[string]string)
+	if m.deps.Store == nil {
+		return out, nil
+	}
+	tasks, err := m.deps.Store.LoadAllTasks(context.Background())
+	if err != nil {
+		return nil, err
+	}
+	for _, task := range tasks {
+		if !strings.EqualFold(filepath.Clean(task.Dir), filepath.Clean(dir)) {
+			continue
+		}
+		files, err := m.deps.Store.ListFiles(context.Background(), task.ID)
+		if err != nil {
+			return nil, err
+		}
+		for _, f := range files {
+			if f.State == "done" && f.OriginalName != "" {
+				rel, err := filepath.Rel(dir, f.Path)
+				if err == nil && filepath.IsLocal(rel) {
+					out[f.OriginalName] = rel
+				}
+			}
+		}
+	}
+	return out, nil
+}
+
+func (m *Manager) Manifests() *manifest.Registry { return m.manifests }

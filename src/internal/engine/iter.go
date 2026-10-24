@@ -18,12 +18,12 @@ import (
 	"github.com/iyear/tdl/core/dcpool"
 	"github.com/iyear/tdl/core/downloader"
 	"github.com/iyear/tdl/core/tmedia"
-	"github.com/iyear/tdl/core/util/fsutil"
 	"github.com/iyear/tdl/core/util/tutil"
 	"github.com/iyear/tdl/pkg/tmessage"
 	"github.com/iyear/tdl/pkg/tplfunc"
 	"github.com/iyear/tdl/pkg/utils"
 
+	"tdl-ui/internal/manifest"
 	"tdl-ui/internal/script"
 	"tdl-ui/internal/scriptapi"
 )
@@ -49,14 +49,25 @@ type fileTemplate struct {
 
 // IterOptions 迭代器装配参数。
 type IterOptions struct {
-	Dir        string
-	RewriteExt bool
-	SkipSame   bool
-	Template   string
-	Group      bool
-	Contracts  *script.Contracts // 可选：过滤/命名脚本契约
-	Renames    map[int]string    // 可选：手动重命名映射（messageId → 自定义文件名，不含扩展名）
-	OnSkip     func(info scriptapi.FileInfo, reason string)
+	LocalMatches   map[string]manifest.LocalMatch
+	RecordManifest bool
+	Manifest       *manifest.Session
+	ManifestMode   string
+	SingleKeys     map[string]bool
+	Dir            string
+	RewriteExt     bool
+	SkipSame       bool
+	ConflictAction string
+	ConflictCheck  string
+	KnownOrigins   map[string]string
+	Outputs        *outputCoordinator
+	Template       string
+	Group          bool
+	Contracts      *script.Contracts // 可选：过滤/命名脚本契约
+	TargetNames    map[string]string
+	OverwriteKeys  map[string]bool
+	Renames        map[int]string // 可选：手动重命名映射（messageId → 自定义文件名，不含扩展名）
+	OnSkip         func(info scriptapi.FileInfo, name, reason, dialogType string)
 	// OnTotalDecr 消息被跳过（无媒体/已删除/被过滤/同名同大小）时回调，
 	// 供消费方递减 total，避免任务 Done 后进度仍显示 12/20（ENG-06）。
 	// 注：断点命中的跳过已计入 finished，不触发此回调。
@@ -66,11 +77,18 @@ type IterOptions struct {
 // iter 下载元素迭代器（对应 ref/tdl/app/dl/iter.go，去除 include/exclude，
 // 由脚本 Filter 接管过滤，Rename 接管命名）。
 type iter struct {
-	pool    dcpool.Pool
-	manager *peers.Manager
-	dialogs []*tmessage.Dialog
-	tpl     *template.Template
-	opts    IterOptions
+	duplicateCounts map[string]int
+	messageCache    map[string]*tg.Message
+	missingMessages map[string]bool
+	root            *os.Root
+	outputs         *outputCoordinator
+	seen            map[string]bool
+	discovered      int
+	pool            dcpool.Pool
+	manager         *peers.Manager
+	dialogs         []*tmessage.Dialog
+	tpl             *template.Template
+	opts            IterOptions
 
 	mu           *sync.Mutex // 保护 finished/err 与索引推进；counter/elem 仅由 Next/Value 的单 goroutine 驱动方访问
 	finished     map[string]struct{}
@@ -83,6 +101,7 @@ type iter struct {
 }
 
 func newIter(pool dcpool.Pool, manager *peers.Manager, dialogs []*tmessage.Dialog, opts IterOptions) (*iter, error) {
+	dialogs = mergeDialogRanges(dialogs)
 	tpl, err := template.New("dl").
 		Funcs(tplfunc.FuncMap(tplfunc.All...)).
 		Parse(opts.Template)
@@ -94,10 +113,25 @@ func newIter(pool dcpool.Pool, manager *peers.Manager, dialogs []*tmessage.Dialo
 		return nil, errors.New("至少需要一条有效的消息链接")
 	}
 
+	root, err := os.OpenRoot(opts.Dir)
+	if err != nil {
+		return nil, err
+	}
+	if opts.Outputs == nil {
+		opts.Outputs = &outputCoordinator{}
+	}
+	if opts.ConflictAction == "" {
+		if opts.SkipSame {
+			opts.ConflictAction = "skip"
+		} else {
+			opts.ConflictAction = "overwrite"
+		}
+	}
 	// 保持 fingerprint 稳定（与 tdl 相同的排序规则）
 	sortDialogs(dialogs)
 
 	return &iter{
+		root: root, outputs: opts.Outputs, seen: make(map[string]bool),
 		pool:    pool,
 		manager: manager,
 		dialogs: dialogs,
@@ -109,6 +143,31 @@ func newIter(pool dcpool.Pool, manager *peers.Manager, dialogs []*tmessage.Dialo
 		counter:  -1,
 		elem:     make(chan downloader.Elem, maxAlbumSize), // 分组消息缓冲（ENG-09 不变量）
 	}, nil
+}
+
+func mergeDialogRanges(dialogs []*tmessage.Dialog) []*tmessage.Dialog {
+	out := []*tmessage.Dialog{}
+	index := map[string]*tmessage.Dialog{}
+	seen := map[string]map[int]bool{}
+	for _, d := range dialogs {
+		key := fmt.Sprintf("%T:%d", d.Peer, tutil.GetInputPeerID(d.Peer))
+		target := index[key]
+		if target == nil {
+			clone := *d
+			clone.Messages = nil
+			target = &clone
+			index[key] = target
+			seen[key] = map[int]bool{}
+			out = append(out, target)
+		}
+		for _, id := range d.Messages {
+			if !seen[key][id] {
+				seen[key][id] = true
+				target.Messages = append(target.Messages, id)
+			}
+		}
+	}
+	return out
 }
 
 func (i *iter) Next(ctx context.Context) bool {
@@ -141,6 +200,11 @@ func (i *iter) process(ctx context.Context) (ret bool, skip bool) {
 		return false, false
 	}
 	peer, msg := i.dialogs[i.dialogIndex].Peer, i.dialogs[i.dialogIndex].Messages[i.messageIndex]
+	var batchIDs []int
+	if i.opts.Manifest != nil || i.opts.ConflictAction == "smart" {
+		source := i.dialogs[i.dialogIndex].Messages
+		batchIDs = append([]int(nil), source[i.messageIndex:min(len(source), i.messageIndex+100)]...)
+	}
 	if i.messageIndex++; i.messageIndex >= len(i.dialogs[i.dialogIndex].Messages) {
 		i.dialogIndex++
 		i.messageIndex = 0
@@ -152,7 +216,16 @@ func (i *iter) process(ctx context.Context) (ret bool, skip bool) {
 		i.setErr(errors.Wrap(err, "resolve from input peer"))
 		return false, false
 	}
-	message, err := tutil.GetSingleMessage(ctx, i.pool.Default(ctx), peer, msg)
+	key := resumeKey(from.ID(), msg, peerDialogType(from))
+	if i.seen[key] {
+		return false, true
+	}
+	var message *tg.Message
+	if i.opts.Manifest != nil || i.opts.ConflictAction == "smart" {
+		message, err = i.manifestMessage(ctx, from, msg, batchIDs)
+	} else {
+		message, err = tutil.GetSingleMessage(ctx, i.pool.Default(ctx), peer, msg)
+	}
 	if err != nil {
 		if errors.Is(err, tutil.ErrMessageDeleted) { // 已删除消息直接跳过
 			i.decrTotal()
@@ -162,25 +235,30 @@ func (i *iter) process(ctx context.Context) (ret bool, skip bool) {
 		return false, false
 	}
 
-	if _, ok := message.GetGroupedID(); ok && i.opts.Group {
+	if _, ok := message.GetGroupedID(); ok && i.opts.Group && !i.opts.SingleKeys[resumeKey(from.ID(), message.ID, peerDialogType(from))] {
 		return i.processGrouped(ctx, message, from)
-	}
-
-	if i.isFinished(resumeKey(from.ID(), message.ID)) { // 断点续传：已完成（已计入 finished，不减 total）
-		return false, true
 	}
 
 	return i.processSingle(ctx, message, from, false)
 }
 
 // resumeKey 断点坐标：内容坐标 "dialogID:messageID"。
-func resumeKey(dialogID int64, messageID int) string {
-	return fmt.Sprintf("%d:%d", dialogID, messageID)
+func resumeKey(dialogID int64, messageID int, typ ...string) string {
+	key := fmt.Sprintf("%d:%d", dialogID, messageID)
+	if len(typ) > 0 && PeerNamespace(typ[0]) != "" {
+		return PeerNamespace(typ[0]) + ":" + key
+	}
+	return key
 }
 
 // processSingle 处理单条消息；inGroup 表示来自相册展开（整组在 total 中仅占 1 个名额，
 // 组内跳过不单独递减 total，由 processGrouped 整组结算）。
 func (i *iter) processSingle(ctx context.Context, message *tg.Message, from peers.Peer, inGroup bool) (bool, bool) {
+	key := resumeKey(from.ID(), message.ID, peerDialogType(from))
+	if i.seen[key] {
+		return false, true
+	}
+	i.seen[key] = true
 	item, ok := tmedia.GetMedia(message)
 	if !ok { // 无媒体消息
 		if !inGroup {
@@ -189,6 +267,10 @@ func (i *iter) processSingle(ctx context.Context, message *tg.Message, from peer
 		return false, true
 	}
 
+	i.discovered++
+	if i.isFinished(key) {
+		return false, true
+	}
 	info := scriptapi.FileInfo{
 		DialogID:    from.ID(),
 		MessageID:   message.ID,
@@ -198,28 +280,43 @@ func (i *iter) processSingle(ctx context.Context, message *tg.Message, from peer
 		FileSize:    item.Size,
 	}
 
+	if i.opts.Manifest != nil && i.opts.Manifest.ShouldSkip(from.ID(), peerDialogType(from), message.ID, MediaIdentity(message), item.Size, i.opts.ManifestMode) {
+		i.notifySkip(info, info.FileName, "已在导入清单中，按清单跳过", peerDialogType(from))
+		return false, true
+	}
+	if i.opts.ConflictAction == "smart" {
+		if match, ok := i.opts.LocalMatches[key]; ok && match.Entry.MediaID == MediaIdentity(message) && match.Entry.Name == item.Name && match.Entry.Size == item.Size && manifest.VerifyDigest(i.root, match.Path, item.Size, match.Entry.SHA256) {
+			if i.opts.Manifest != nil && i.opts.RecordManifest && i.opts.Manifest.MatchesSource(from.ID(), peerDialogType(from)) {
+				match.Entry.Date = int64(message.Date)
+				match.Entry.Evidence = "source"
+				if err := i.opts.Manifest.MarkDone(match.Entry); err != nil {
+					i.setErr(err)
+					return false, false
+				}
+			}
+			i.notifySkip(info, info.FileName, "本地已有：原名、大小及来源比对通过", peerDialogType(from))
+			return false, true
+		}
+	}
 	// 脚本过滤：返回 false 则跳过该文件
 	if keep, err := i.opts.Contracts.SafeFilter(info); err != nil {
-		i.notifySkip(info, fmt.Sprintf("过滤脚本出错，默认保留: %v", err))
+		logEngine.Warnf("过滤脚本出错，默认保留: %v", err)
 	} else if !keep {
-		i.notifySkip(info, "被过滤脚本跳过")
-		if !inGroup {
-			i.decrTotal()
-		}
+		i.notifySkip(info, info.FileName, "被过滤脚本跳过", peerDialogType(from))
 		return false, true
 	}
 
 	// 命名：手动重命名 > 脚本 Rename > 默认模板
-	name := ""
+	name := i.opts.TargetNames[key]
 	// 1. 手动重命名（用户指定，最高优先级）
-	if customName, ok := i.opts.Renames[info.MessageID]; ok && customName != "" {
+	if customName, ok := i.opts.Renames[info.MessageID]; name == "" && ok && customName != "" {
 		ext := filepath.Ext(info.FileName)
 		name = customName + ext
 	}
 	// 2. 脚本 Rename
 	if name == "" && i.opts.Contracts.HasRename() {
 		if n, err := i.opts.Contracts.SafeRename(info); err != nil {
-			i.notifySkip(info, fmt.Sprintf("命名脚本出错，回退默认模板: %v", err))
+			logEngine.Warnf("命名脚本出错，回退默认模板: %v", err)
 		} else {
 			name = n
 		}
@@ -241,44 +338,36 @@ func (i *iter) processSingle(ctx context.Context, message *tg.Message, from peer
 		name = toName.String()
 	}
 
-	if i.opts.SkipSame {
-		if stat, err := os.Stat(filepath.Join(i.opts.Dir, name)); err == nil {
-			if fsutil.GetNameWithoutExt(name) == fsutil.GetNameWithoutExt(stat.Name()) &&
-				stat.Size() == item.Size {
-				i.notifySkip(info, "本地已存在同名同大小文件")
-				if !inGroup {
-					i.decrTotal()
-				}
-				return false, true
-			}
-		}
-	}
-
-	path := filepath.Join(i.opts.Dir, name+tempExt)
-
-	// 命名结果可包含子目录，按需创建
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		i.setErr(errors.Wrap(err, "create dir"))
+	name, err := cleanOutputName(name)
+	if err != nil {
+		i.setErr(err)
 		return false, false
 	}
-
-	to, err := os.Create(path)
+	action := i.opts.ConflictAction
+	if action == "overwrite" && i.opts.OverwriteKeys != nil && !i.opts.OverwriteKeys[key] {
+		action = "rename"
+	}
+	to, name, err := i.allocate(name, info.FileName, action)
+	if errors.Is(err, errOutputSkipped) {
+		i.notifySkip(info, nameOrOriginal(name, info.FileName), "本地或队列中已存在同名文件", peerDialogType(from))
+		return false, true
+	}
 	if err != nil {
-		i.setErr(errors.Wrap(err, "create file"))
+		i.setErr(errors.Wrap(err, "准备目标文件失败"))
 		return false, false
 	}
 
 	i.counter++
 	i.elem <- &iterElem{
 		id:        i.counter,
-		resumeKey: resumeKey(from.ID(), message.ID),
+		resumeKey: resumeKey(from.ID(), message.ID, peerDialogType(from)),
 
 		from:    from,
 		fromMsg: message,
 		file:    item,
 		info:    info,
 
-		to: to,
+		to: to, targetName: name, outputAction: action,
 	}
 
 	return true, false
@@ -291,13 +380,8 @@ func (i *iter) processGrouped(ctx context.Context, message *tg.Message, from pee
 		return false, false
 	}
 
-	hasValid, anyFinished := false, false
+	hasValid := false
 	for _, msg := range grouped {
-		if i.isFinished(resumeKey(from.ID(), msg.ID)) {
-			anyFinished = true
-			continue
-		}
-
 		ret, skip := i.processSingle(ctx, msg, from, true)
 		if !ret && !skip {
 			return false, false
@@ -306,16 +390,19 @@ func (i *iter) processGrouped(ctx context.Context, message *tg.Message, from pee
 			hasValid = true
 		}
 	}
-
-	if !hasValid && !anyFinished {
-		i.decrTotal() // 整组无一产出且非断点命中，释放该组占用的 total 名额
-	}
 	return hasValid, !hasValid
 }
 
-func (i *iter) notifySkip(info scriptapi.FileInfo, reason string) {
+func nameOrOriginal(name, original string) string {
+	if name != "" {
+		return name
+	}
+	return original
+}
+
+func (i *iter) notifySkip(info scriptapi.FileInfo, name, reason, dialogType string) {
 	if i.opts.OnSkip != nil {
-		i.opts.OnSkip(info, reason)
+		i.opts.OnSkip(info, name, reason, dialogType)
 	}
 }
 
@@ -346,13 +433,18 @@ func (i *iter) Value() downloader.Elem { return <-i.elem }
 // 暂停/取消时 downloader 已停止消费，通道内未被消费的元素若不清理，
 // fd 会泄漏到进程退出，孤儿 .tmp 也因未登记而无法被删除流程覆盖。
 func (i *iter) Close() {
+	defer i.root.Close()
 	for {
 		select {
 		case e := <-i.elem:
 			if el, ok := e.(*iterElem); ok && el.to != nil {
 				name := el.to.Name()
 				_ = el.to.Close()
-				_ = os.Remove(name)
+				rel, err := filepath.Rel(i.opts.Dir, name)
+				if err == nil {
+					_ = i.root.Remove(rel)
+				}
+				i.release(el.targetName)
 			}
 		default:
 			return
@@ -408,5 +500,18 @@ func sortDialogs(dialogs []*tmessage.Dialog) {
 
 	for _, m := range dialogs {
 		sort.Ints(m.Messages)
+	}
+}
+
+func peerDialogType(p peers.Peer) string {
+	switch p.(type) {
+	case peers.User:
+		return DialogPrivate
+	case peers.Chat:
+		return DialogGroup
+	case peers.Channel:
+		return DialogChannel
+	default:
+		return ""
 	}
 }

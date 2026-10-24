@@ -49,7 +49,7 @@ export const useTasksStore = defineStore('tasks', {
       }
     },
     onFile(f: FileEvent) {
-      if (f.state === 'done') {
+      if (f.state === 'done' || f.state === 'skipped') {
         const m = this.files[f.taskId]
         if (m) delete m[f.fileId]
         return
@@ -92,6 +92,10 @@ export const useTasksStore = defineStore('tasks', {
     },
     async redownloadFile(taskId: string, filePath: string) {
       await Download.redownloadFile(taskId, filePath)
+      await this.refresh()
+    },
+    async redownloadFiles(taskId: string, filePaths: string[]) {
+      await Download.redownloadFiles(taskId, filePaths)
       await this.refresh()
     },
     async deleteFileRecord(taskId: string, filePath: string) {

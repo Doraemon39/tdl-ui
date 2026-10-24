@@ -1,16 +1,17 @@
 module tdl-ui
 
-go 1.25.8
+go 1.26.0
 
 require (
 	github.com/gabriel-vasile/mimetype v1.4.13
 	github.com/go-faster/errors v0.7.1
-	github.com/gotd/td v0.140.0
+	github.com/gotd/td v0.145.1
 	github.com/iyear/tdl v0.20.3
 	github.com/iyear/tdl/core v0.20.3
 	github.com/traefik/yaegi v0.16.1
 	github.com/wailsapp/wails/v2 v2.11.0
 	go.uber.org/zap v1.28.0
+	golang.org/x/sys v0.48.0
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1
 	gopkg.in/yaml.v2 v2.4.0
 	modernc.org/sqlite v1.54.0
@@ -45,7 +46,7 @@ require (
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/iyear/connectproxy v0.1.1 // indirect
 	github.com/jchv/go-winloader v0.0.0-20210711035445-715c2860da7e // indirect
-	github.com/klauspost/compress v1.18.6 // indirect
+	github.com/klauspost/compress v1.18.7 // indirect
 	github.com/labstack/echo/v4 v4.13.3 // indirect
 	github.com/labstack/gommon v0.4.2 // indirect
 	github.com/leaanthony/go-ansi-parser v1.6.1 // indirect
@@ -57,7 +58,7 @@ require (
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/mitchellh/mapstructure v1.5.0 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
-	github.com/ogen-go/ogen v1.19.0 // indirect
+	github.com/ogen-go/ogen v1.20.3 // indirect
 	github.com/pkg/browser v0.0.0-20240102092130-5ac0b6a4141c // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
@@ -74,19 +75,18 @@ require (
 	github.com/wailsapp/go-webview2 v1.0.22 // indirect
 	github.com/wailsapp/mimetype v1.4.1 // indirect
 	go.etcd.io/bbolt v1.3.10 // indirect
-	go.opentelemetry.io/otel v1.41.0 // indirect
-	go.opentelemetry.io/otel/metric v1.41.0 // indirect
-	go.opentelemetry.io/otel/trace v1.41.0 // indirect
+	go.opentelemetry.io/otel v1.42.0 // indirect
+	go.opentelemetry.io/otel/metric v1.42.0 // indirect
+	go.opentelemetry.io/otel/trace v1.42.0 // indirect
 	go.uber.org/atomic v1.11.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
-	golang.org/x/crypto v0.53.0 // indirect
+	golang.org/x/crypto v0.57.0 // indirect
 	golang.org/x/exp v0.0.0-20240719175910-8a7402abbf56 // indirect
-	golang.org/x/mod v0.37.0 // indirect
-	golang.org/x/net v0.56.0 // indirect
-	golang.org/x/sync v0.21.0 // indirect
-	golang.org/x/sys v0.46.0 // indirect
-	golang.org/x/text v0.38.0 // indirect
-	golang.org/x/tools v0.47.0 // indirect
+	golang.org/x/mod v0.41.0 // indirect
+	golang.org/x/net v0.60.0 // indirect
+	golang.org/x/sync v0.23.0 // indirect
+	golang.org/x/text v0.42.0 // indirect
+	golang.org/x/tools v0.49.0 // indirect
 	modernc.org/libc v1.74.1 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
@@ -96,7 +96,7 @@ require (
 // ARC-05：tdl 依赖来自 fork（见 .gitmodules），必须经 submodule 本地 replace 引入；
 // require 中的版本号仅作记录，实际以 ref/tdl 当前 checkout 为准。
 // 构建前须执行 git submodule update --init，submodule commit 变更需随本仓库一起提交。
-// 注：上方 go 指令的 patch 版本号由 ref/tdl 的 go.mod（go 1.25.8）钉住，go mod tidy 会自动回写。
+// Go 1.26 is required by the patched x/crypto and x/net dependency set.
 replace (
 	github.com/iyear/tdl => ../ref/tdl
 	github.com/iyear/tdl/core => ../ref/tdl/core

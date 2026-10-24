@@ -352,3 +352,33 @@ func TestRecentDirsClampedTo3(t *testing.T) {
 		t.Errorf("应裁剪到 3 条，实际 %d 条", len(got))
 	}
 }
+
+func TestExitActionRoundTrip(t *testing.T) {
+	m := newTestManager(t)
+	s := m.Get()
+	if s.ExitAction != "prompt" {
+		t.Errorf("默认 ExitAction 应为 prompt，实际 %s", s.ExitAction)
+	}
+
+	s.ExitAction = "clean_cache"
+	if err := m.Update(s); err != nil {
+		t.Fatalf("Update 失败: %v", err)
+	}
+
+	m2, err := NewManagerAt(m.DataDir())
+	if err != nil {
+		t.Fatalf("NewManagerAt 失败: %v", err)
+	}
+	if m2.Get().ExitAction != "clean_cache" {
+		t.Errorf("ExitAction 应持久化为 clean_cache，实际 %s", m2.Get().ExitAction)
+	}
+}
+
+func TestResolveDataDir(t *testing.T) {
+	base := t.TempDir()
+	exe := filepath.Join(base, "bin", "app.exe")
+	dir, portable, err := resolveDataDir(exe, filepath.Join(base, "config"))
+	if err != nil || !portable || dir != filepath.Join(base, "bin", "tdl-ui-data") {
+		t.Fatalf("unexpected result: %q %v %v", dir, portable, err)
+	}
+}

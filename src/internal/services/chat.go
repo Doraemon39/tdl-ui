@@ -22,15 +22,17 @@ import (
 	"tdl-ui/internal/config"
 	"tdl-ui/internal/engine"
 	"tdl-ui/internal/logging"
+	"tdl-ui/internal/safeio"
 )
 
 var logChat = logging.L("chat")
 
 // 对话类型（定义在 engine，与 ref/tdl/app/chat 一致）。
 const (
-	DialogPrivate = engine.DialogPrivate
-	DialogGroup   = engine.DialogGroup
-	DialogChannel = engine.DialogChannel
+	DialogPrivate    = engine.DialogPrivate
+	DialogGroup      = engine.DialogGroup
+	DialogSupergroup = engine.DialogSupergroup
+	DialogChannel    = engine.DialogChannel
 )
 
 // 媒体类型。
@@ -43,6 +45,7 @@ const (
 
 // Dialog 对话视图（私聊用户 / 群组 / 频道）。
 type Dialog struct {
+	IsSelf        bool   `json:"isSelf,omitempty"`
 	ID            int64  `json:"id"`
 	Type          string `json:"type"`
 	Title         string `json:"title"`
@@ -67,6 +70,7 @@ type MediaQuery struct {
 
 // MediaItem 对话内的一个媒体文件（Dialog 1 — N MediaItem）。
 type MediaItem struct {
+	MediaID   string `json:"mediaId"`
 	DialogID  int64  `json:"dialogId"`
 	MessageID int    `json:"messageId"`
 	Name      string `json:"name"`
@@ -126,8 +130,10 @@ const (
 // 列表查询经 jobs 通道串行化，缩略图/预览图走独立的 thumbJobs 队列（小并发度），
 // 视频分段走 videoJobs 队列，避免单张大图预览或视频推流阻塞列表与缩略图加载（ARC-04）。
 type ChatService struct {
-	cfg *config.Manager
-	kv  kv.Storage
+	closing             bool
+	connectionAccountID int64
+	cfg                 *config.Manager
+	kv                  kv.Storage
 
 	mu        sync.Mutex
 	running   bool
@@ -160,11 +166,13 @@ type ChatService struct {
 // NewChatService 创建对话服务。
 func NewChatService(cfg *config.Manager, kvs kv.Storage) *ChatService {
 	service := &ChatService{
-		cfg:       cfg,
-		kv:        kvs,
-		thumbs:    newThumbCache(func() string { return cfg.CacheDir() }),
+		cfg: cfg,
+		kv:  kvs,
+		thumbs: newThumbCache(func() string { return cfg.CacheDir() }, func(dir string) bool {
+			return safeio.Equal(dir, filepath.Join(cfg.DataDir(), "cache", "thumbs")) || safeio.Equal(dir, filepath.Join(cfg.DataDir(), "cache", "previews"))
+		}),
 		videos:    newVideoCache(),
-		videoDisk: newVideoDiskCache(func() string { return cfg.TempDir() }),
+		videoDisk: newVideoDiskCache(func() string { return cfg.TempDir() }, func(dir string) bool { return safeio.Equal(dir, filepath.Join(cfg.DataDir(), "tmp", "video")) }),
 	}
 	// 初始化缩略图预加载器
 	service.thumbPreloader = NewThumbPreloader(service)
@@ -180,6 +188,14 @@ func NewChatService(cfg *config.Manager, kvs kv.Storage) *ChatService {
 
 // ClearThumbCache 清空缩略图/预览图磁盘缓存、视频内存缓存与视频磁盘分段（设置页「清空缓存」入口，SVC-18）。
 func (s *ChatService) ClearThumbCache() error {
+	if s.cfg != nil {
+		if err := s.cfg.ValidateMediaCacheClear(); err != nil {
+			return err
+		}
+	}
+	if s.tieredCache != nil {
+		s.tieredCache.ClearMemory()
+	}
 	if s.videos != nil {
 		s.videos.Clear()
 	}
@@ -193,6 +209,15 @@ func (s *ChatService) ClearThumbCache() error {
 
 // Stop 关闭常驻连接（登出/重登后会话失效时调用），下次查询自动重建。
 func (s *ChatService) Stop() {
+	if s.tieredCache != nil {
+		s.tieredCache.ClearMemory()
+	}
+	if s.cacheWarmer != nil {
+		s.cacheWarmer.ClearAllPatterns()
+	}
+	if s.videos != nil {
+		s.videos.Clear()
+	}
 	s.prefetch.stop() // 会话即将失效，后台预取一并取消
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -203,9 +228,20 @@ func (s *ChatService) Stop() {
 }
 
 // StopAndWait 停止常驻连接并等待执行协程退出（应用关闭编排用）。
-func (s *ChatService) StopAndWait(timeout time.Duration) {
+func (s *ChatService) StopAndWait(timeout time.Duration) bool {
+	if s.tieredCache != nil {
+		s.tieredCache.Close()
+	}
 	s.prefetch.stop()
 	s.mu.Lock()
+	s.closing = true
+	if s.thumbs != nil {
+		s.thumbs.InvalidateWrites()
+	}
+	if s.videoDisk != nil {
+		s.videoDisk.Close()
+	}
+
 	if s.cancel != nil {
 		logChat.Infof("停止常驻 Telegram 连接")
 		s.cancel()
@@ -214,12 +250,14 @@ func (s *ChatService) StopAndWait(timeout time.Duration) {
 	s.mu.Unlock()
 
 	if dead == nil {
-		return
+		return true
 	}
 	select {
 	case <-dead:
+		return true
 	case <-time.After(timeout):
 		logChat.Warnf("等待 Telegram 连接退出超时（%s），继续关闭流程", timeout)
+		return false
 	}
 }
 
@@ -254,8 +292,14 @@ func (s *ChatService) ListDialogs() ([]Dialog, error) {
 
 // ListMedia 游标分页查询对话内的媒体文件（视频 / 图片 / 音频 / 文档）。
 func (s *ChatService) ListMedia(q MediaQuery) (*MediaPage, error) {
-	logChat.Debugf("查询媒体: dialog=%d type=%s offset=%d limit=%d kinds=%v query=%q", q.DialogID, q.DialogType, q.OffsetID, q.Limit, q.Kinds, q.Query)
-	if q.DialogID == 0 {
+	logChat.Debugf("查询媒体: dialog=%d type=%s offset=%d limit=%d kinds=%v queryLength=%d", q.DialogID, q.DialogType, q.OffsetID, q.Limit, q.Kinds, len(q.Query))
+	if engine.PeerNamespace(q.DialogType) == "" {
+		return nil, errors.New("对话类型无效")
+	}
+	if q.OffsetID < 0 || int64(q.OffsetID) > 2147483647 {
+		return nil, errors.New("媒体分页消息 ID 无效")
+	}
+	if q.DialogID <= 0 {
 		return nil, errors.New("缺少对话 ID")
 	}
 	if q.Limit <= 0 {
@@ -406,6 +450,15 @@ func (s *ChatService) invokeVideo(ctx context.Context, fn func(ctx context.Conte
 }
 
 func (s *ChatService) submit(ctx context.Context, queue chatQueue, fn func(ctx context.Context, api *tg.Client) error) error {
+	release, err := s.cfg.UseSession()
+	if err != nil {
+		return err
+	}
+	defer release()
+	owner := cacheOwner(s.cfg)
+	if s.cfg != nil && owner <= 0 {
+		return errNotLoggedIn
+	}
 	if err := s.ensureStarted(); err != nil {
 		return err
 	}
@@ -432,6 +485,9 @@ func (s *ChatService) submit(ctx context.Context, queue chatQueue, fn func(ctx c
 
 	select {
 	case err := <-j.done:
+		if cacheOwner(s.cfg) != owner {
+			return errors.New("账号会话已变更")
+		}
 		return err
 	case <-dead:
 		return errors.New("Telegram 连接已断开，请重试")
@@ -440,13 +496,43 @@ func (s *ChatService) submit(ctx context.Context, queue chatQueue, fn func(ctx c
 	}
 }
 
+func (s *ChatService) StopForSessionChange() error {
+	s.Stop()
+	s.mu.Lock()
+	dead := s.dead
+	s.mu.Unlock()
+	if dead == nil {
+		return nil
+	}
+	select {
+	case <-dead:
+		return nil
+	case <-time.After(5 * time.Second):
+		return errors.New("旧会话尚未停止")
+	}
+}
+
 // ensureStarted 懒启动常驻客户端。
 // 不在持锁状态下等待建连结果，避免与执行协程的收尾逻辑互锁；
 // 并发调用时仅有一个建连流程，其余调用等待其结果后重新检查。
 func (s *ChatService) ensureStarted() error {
+	if s.kv == nil && s.runClient == nil {
+		return errNotLoggedIn
+	}
 	for {
 		s.mu.Lock()
+		if s.closing {
+			s.mu.Unlock()
+			return errors.New("应用正在退出")
+		}
 		if s.running {
+			if s.connectionAccountID != cacheOwner(s.cfg) {
+				if s.cancel != nil {
+					s.cancel()
+				}
+				s.mu.Unlock()
+				return errors.New("账号会话已变更，请刷新后重试")
+			}
 			s.mu.Unlock()
 			return nil
 		}
@@ -489,6 +575,7 @@ func (s *ChatService) start() error {
 	s.mu.Lock()
 	s.cancel = cancel
 	s.dead = dead
+	s.connectionAccountID = cacheOwner(s.cfg)
 	s.mu.Unlock()
 
 	go func() {
@@ -580,6 +667,11 @@ func (s *ChatService) runTelegramClient(ctx context.Context, ready chan<- error,
 			ready <- errNotLoggedIn
 			return errNotLoggedIn
 		}
+		if st.User == nil || st.User.ID != cacheOwner(s.cfg) {
+			err := errors.New("实际登录账号与本地记录不一致，请重新登录或导入会话")
+			ready <- err
+			return err
+		}
 		ready <- nil
 
 		// worker 消费指定队列：跳过调用方已放弃的任务，并把调用方取消传播到实际执行（SVC-01）
@@ -663,7 +755,14 @@ func fetchDialogs(ctx context.Context, api *tg.Client, manager *peers.Manager) (
 		offsetDate int
 		offsetPeer tg.InputPeerClass = &tg.InputPeerEmpty{}
 		seen                         = make(map[peerKey]struct{})
+		selfID     int64
 	)
+
+	if manager != nil {
+		if self, err := manager.Self(ctx); err == nil {
+			selfID = self.ID()
+		}
+	}
 
 	for {
 		res, err := api.MessagesGetDialogs(ctx, &tg.MessagesGetDialogsRequest{
@@ -697,13 +796,21 @@ func fetchDialogs(ctx context.Context, api *tg.Client, manager *peers.Manager) (
 			break
 		}
 
+		for _, u := range users {
+			if user, ok := u.(*tg.User); ok && user.Self && selfID == 0 {
+				selfID = user.ID
+			}
+		}
+
 		entities := newEntities(users, chats)
 		messageMap := newMessageMap(msgSlice)
 
 		// SVC-05：整页 users/chats 一次性批量落盘 access hash（单次 kv 事务），
 		// 失败记日志，后续 ListMedia 解析 peer 失败时可从此追溯根因。
-		if err := manager.Apply(ctx, users, chats); err != nil {
-			logChat.Warnf("缓存对话 access hash 失败: %v", err)
+		if manager != nil {
+			if err := manager.Apply(ctx, users, chats); err != nil {
+				logChat.Warnf("缓存对话 access hash 失败: %v", err)
+			}
 		}
 
 		for _, dc := range dialogsSlice {
@@ -721,7 +828,7 @@ func fetchDialogs(ctx context.Context, api *tg.Client, manager *peers.Manager) (
 			}
 			seen[key] = struct{}{}
 
-			d := buildDialog(dialog, entities, messageMap)
+			d := buildDialog(dialog, entities, messageMap, selfID)
 			if d == nil { // 失效或不支持的对话，跳过
 				continue
 			}
@@ -734,7 +841,7 @@ func fetchDialogs(ctx context.Context, api *tg.Client, manager *peers.Manager) (
 		if !ok {
 			break
 		}
-		nextPeer, ok := nextOffsetPeer(entities, last.Peer)
+		nextPeer, ok := nextOffsetPeer(entities, last.Peer, selfID)
 		if !ok {
 			break // 缺少 access hash，无法继续翻页
 		}
@@ -748,6 +855,24 @@ func fetchDialogs(ctx context.Context, api *tg.Client, manager *peers.Manager) (
 
 		if len(dialogsSlice) < batchSize {
 			break
+		}
+	}
+
+	// 确保「收藏夹」在对话列表中
+	if selfID > 0 {
+		hasSelf := false
+		for _, d := range result {
+			if d.ID == selfID && d.Type == DialogPrivate {
+				hasSelf = true
+				break
+			}
+		}
+		if !hasSelf {
+			result = append([]Dialog{{
+				ID:    selfID,
+				Type:  DialogPrivate,
+				Title: "收藏夹", IsSelf: true,
+			}}, result...)
 		}
 	}
 
@@ -804,7 +929,11 @@ func keyOfPeer(p tg.PeerClass) peerKey {
 }
 
 // buildDialog 由原始对话与实体构建视图；实体缺失或类型不支持时返回 nil。
-func buildDialog(d *tg.Dialog, entities peer.Entities, messageMap map[int]tg.NotEmptyMessage) *Dialog {
+func buildDialog(d *tg.Dialog, entities peer.Entities, messageMap map[int]tg.NotEmptyMessage, selfIDs ...int64) *Dialog {
+	var selfID int64
+	if len(selfIDs) > 0 {
+		selfID = selfIDs[0]
+	}
 	out := &Dialog{UnreadCount: d.UnreadCount}
 	if m, ok := messageMap[d.TopMessage]; ok {
 		out.LastMessageAt = int64(m.GetDate())
@@ -814,12 +943,26 @@ func buildDialog(d *tg.Dialog, entities peer.Entities, messageMap map[int]tg.Not
 	case *tg.PeerUser:
 		u, ok := entities.User(p.UserID)
 		if !ok {
+			if selfID > 0 && p.UserID == selfID {
+				out.ID = p.UserID
+				out.Type = DialogPrivate
+				out.Title = "收藏夹"
+				out.IsSelf = true
+				out.Username = ""
+				return out
+			}
 			return nil
 		}
 		out.ID = u.ID
 		out.Type = DialogPrivate
-		out.Title = visibleName(u.FirstName, u.LastName)
-		out.Username = u.Username
+		if u.Self || (selfID > 0 && u.ID == selfID) {
+			out.Title = "收藏夹"
+			out.IsSelf = true
+			out.Username = ""
+		} else {
+			out.Title = visibleName(u.FirstName, u.LastName)
+			out.Username = u.Username
+		}
 	case *tg.PeerChat:
 		c, ok := entities.Chat(p.ChatID)
 		if !ok {
@@ -840,7 +983,7 @@ func buildDialog(d *tg.Dialog, entities peer.Entities, messageMap map[int]tg.Not
 		case c.Broadcast:
 			out.Type = DialogChannel
 		case c.Megagroup || c.Gigagroup:
-			out.Type = DialogGroup
+			out.Type = DialogSupergroup
 		default:
 			return nil // 不支持的频道形态
 		}
@@ -855,10 +998,20 @@ func buildDialog(d *tg.Dialog, entities peer.Entities, messageMap map[int]tg.Not
 }
 
 // nextOffsetPeer 生成翻页游标所需的输入 peer（带 access hash）。
-func nextOffsetPeer(entities peer.Entities, p tg.PeerClass) (tg.InputPeerClass, bool) {
+func nextOffsetPeer(entities peer.Entities, p tg.PeerClass, selfIDs ...int64) (tg.InputPeerClass, bool) {
+	var selfID int64
+	if len(selfIDs) > 0 {
+		selfID = selfIDs[0]
+	}
 	switch v := p.(type) {
 	case *tg.PeerUser:
+		if selfID > 0 && v.UserID == selfID {
+			return &tg.InputPeerSelf{}, true
+		}
 		if u, ok := entities.User(v.UserID); ok {
+			if u.Self {
+				return &tg.InputPeerSelf{}, true
+			}
 			return &tg.InputPeerUser{UserID: v.UserID, AccessHash: u.AccessHash}, true
 		}
 	case *tg.PeerChat:
@@ -1006,6 +1159,7 @@ func toMediaItem(dialogID int64, m *tg.Message) (MediaItem, bool) {
 			return MediaItem{}, false
 		}
 		out := MediaItem{
+			MediaID:   engine.MediaIdentity(m),
 			DialogID:  dialogID,
 			MessageID: m.ID,
 			Name:      item.Name,
@@ -1027,6 +1181,7 @@ func toMediaItem(dialogID int64, m *tg.Message) (MediaItem, bool) {
 		}
 		w, h := docDims(doc)
 		return MediaItem{
+			MediaID:   engine.MediaIdentity(m),
 			DialogID:  dialogID,
 			MessageID: m.ID,
 			Name:      tmedia.GetDocumentName(doc),
@@ -1179,10 +1334,10 @@ func contains(list []string, v string) bool {
 func (s *ChatService) ReportPerformance(label string, duration float64) {
 	// 记录性能指标到日志
 	logChat.Infof("性能指标: %s = %.2fms", label, duration)
-	
+
 	// 可以在这里添加更多的性能数据处理和存储逻辑
 	// 例如：写入数据库、发送到监控系统、触发性能告警等
-	
+
 	// 简单的性能告警：如果某个操作耗时过长，记录警告
 	if duration > 5000 { // 超过5秒
 		logChat.Warnf("性能警告: %s 耗时过长 (%.2fms)", label, duration)

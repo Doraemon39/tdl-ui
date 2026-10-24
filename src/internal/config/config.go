@@ -12,6 +12,7 @@ import (
 	"gopkg.in/yaml.v2"
 
 	"tdl-ui/internal/logging"
+	"tdl-ui/internal/safeio"
 )
 
 // UISettings 界面偏好（日志页字号、滚动条尺寸与最大滚动行数）
@@ -64,6 +65,7 @@ const (
 
 // Settings 应用全局设置（对前端与服务层暴露的扁平结构，仅保留 JSON 标签）。
 type Settings struct {
+	NamingPolicyVersion int `json:"namingPolicyVersion"`
 	// Proxy 代理地址，如 socks5://127.0.0.1:1080 或 http://127.0.0.1:8080，空为直连
 	Proxy string `json:"proxy"`
 	// ProxyMode 代理模式：system=使用系统代理（默认）/ custom=自定义代理 / off=禁用代理
@@ -72,6 +74,10 @@ type Settings struct {
 	DownloadDir string `json:"downloadDir"`
 	// Template 默认文件命名模板（Go text/template，与 tdl 兼容）
 	Template string `json:"template"`
+	// ConflictAction 同名文件处理动作：skip=跳过同名文件（默认） / overwrite=覆盖同名文件 / rename=自动重命名
+	ConflictAction string `json:"conflictAction"`
+	// ConflictCheck 同名比对依据：target=按最终保存文件名 / origin=按 Telegram 原始文件名（默认）
+	ConflictCheck string `json:"conflictCheck"`
 	// Threads 单文件下载线程数
 	Threads int `json:"threads"`
 	// Limit 同时下载的最大文件数
@@ -104,19 +110,25 @@ type Settings struct {
 	TemplatesSeeded bool `json:"templatesSeeded"`
 	// Log 日志配置（输出目标、级别、目录、格式与滚动策略）
 	Log logging.LogSettings `json:"log"`
+	// ExitAction 持久化退出策略：prompt / direct / clean_cache；wipe_all 每次确认。
+	ExitAction string `json:"exitAction"`
 }
 
 // yamlConfig 是持久化用的分组结构，与扁平 Settings 互转。
 type yamlConfig struct {
 	App struct {
-		Theme string `yaml:"theme"`
+		Theme      string `yaml:"theme"`
+		ExitAction string `yaml:"exitAction"`
 	} `yaml:"app"`
 	Download struct {
-		Dir      string `yaml:"dir"`
-		Template string `yaml:"template"`
-		Threads  int    `yaml:"threads"`
-		Limit    int    `yaml:"limit"`
-		PoolSize int    `yaml:"poolSize"`
+		NamingPolicyVersion int    `yaml:"namingPolicyVersion"`
+		Dir                 string `yaml:"dir"`
+		Template            string `yaml:"template"`
+		ConflictAction      string `yaml:"conflictAction"`
+		ConflictCheck       string `yaml:"conflictCheck"`
+		Threads             int    `yaml:"threads"`
+		Limit               int    `yaml:"limit"`
+		PoolSize            int    `yaml:"poolSize"`
 	} `yaml:"download"`
 	Storage struct {
 		CacheDir string `yaml:"cacheDir"`
@@ -137,8 +149,8 @@ type yamlConfig struct {
 		Enabled         []string `yaml:"enabled"`
 		TemplatesSeeded bool     `yaml:"templatesSeeded"`
 	} `yaml:"scripts"`
-	Log        logging.LogSettings `yaml:"log"`
-	Session    struct {
+	Log     logging.LogSettings `yaml:"log"`
+	Session struct {
 		Proxy            string `yaml:"proxy"`
 		ProxyMode        string `yaml:"proxyMode"`
 		LoggedInUserID   int64  `yaml:"loggedInUserId"`
@@ -150,8 +162,12 @@ type yamlConfig struct {
 func settingsToYAML(s Settings) yamlConfig {
 	var y yamlConfig
 	y.App.Theme = s.Theme
+	y.App.ExitAction = s.ExitAction
+	y.Download.NamingPolicyVersion = s.NamingPolicyVersion
 	y.Download.Dir = s.DownloadDir
 	y.Download.Template = s.Template
+	y.Download.ConflictAction = s.ConflictAction
+	y.Download.ConflictCheck = s.ConflictCheck
 	y.Download.Threads = s.Threads
 	y.Download.Limit = s.Limit
 	y.Download.PoolSize = s.PoolSize
@@ -176,26 +192,42 @@ func settingsToYAML(s Settings) yamlConfig {
 
 func yamlToSettings(y yamlConfig) Settings {
 	proxyMode := y.Session.ProxyMode
+	conflictAction := y.Download.ConflictAction
+	if conflictAction == "" {
+		conflictAction = "skip"
+	}
+	conflictCheck := y.Download.ConflictCheck
+	if conflictCheck == "" {
+		conflictCheck = "origin"
+	}
 	// 旧配置迁移：无 proxyMode 字段但已填写自定义代理地址的，视为 custom（一次性推断，保存后固化）
 	if proxyMode == "" && y.Session.Proxy != "" {
 		proxyMode = ProxyModeCustom
 	}
+	exitAction := y.App.ExitAction
+	if exitAction == "" {
+		exitAction = "prompt"
+	}
 	return Settings{
-		Proxy:              y.Session.Proxy,
-		ProxyMode:          proxyMode,
-		DownloadDir:        y.Download.Dir,
-		Template:           y.Download.Template,
-		Threads:            y.Download.Threads,
-		Limit:              y.Download.Limit,
-		PoolSize:           y.Download.PoolSize,
-		Theme:              y.App.Theme,
-		CacheDir:           y.Storage.CacheDir,
-		TempDir:            y.Storage.TempDir,
-		LoggedInUserID:     y.Session.LoggedInUserID,
-		LoggedInUsername:   y.Session.LoggedInUsername,
-		ThumbWorkers:       y.Tuning.ThumbWorkers,
-		VideoWorkers:       y.Tuning.VideoWorkers,
-		ProgressIntervalMs: y.Tuning.ProgressIntervalMs,
+		NamingPolicyVersion: y.Download.NamingPolicyVersion,
+		Proxy:               y.Session.Proxy,
+		ProxyMode:           proxyMode,
+		DownloadDir:         y.Download.Dir,
+		Template:            y.Download.Template,
+		ConflictAction:      conflictAction,
+		ConflictCheck:       conflictCheck,
+		Threads:             y.Download.Threads,
+		Limit:               y.Download.Limit,
+		PoolSize:            y.Download.PoolSize,
+		Theme:               y.App.Theme,
+		ExitAction:          exitAction,
+		CacheDir:            y.Storage.CacheDir,
+		TempDir:             y.Storage.TempDir,
+		LoggedInUserID:      y.Session.LoggedInUserID,
+		LoggedInUsername:    y.Session.LoggedInUsername,
+		ThumbWorkers:        y.Tuning.ThumbWorkers,
+		VideoWorkers:        y.Tuning.VideoWorkers,
+		ProgressIntervalMs:  y.Tuning.ProgressIntervalMs,
 		UI: UISettings{
 			LogFontSize:   y.UI.LogFontSize,
 			ScrollbarSize: y.UI.ScrollbarSize,
@@ -208,44 +240,124 @@ func yamlToSettings(y yamlConfig) Settings {
 	}
 }
 
-// DefaultTemplate 与 tdl CLI 默认命名模板保持一致。
-const DefaultTemplate = "{{ .DialogID }}_{{ .MessageID }}_{{ filenamify .FileName }}"
+// DefaultTemplate preserves the original filename, sanitized for the local filesystem.
+const DefaultTemplate = "{{ filenamify .FileName }}"
+const LegacyDefaultTemplate = "{{ .DialogID }}_{{ .MessageID }}_{{ filenamify .FileName }}"
 
 // Manager 负责设置的加载与保存，并提供数据目录路径。
 type Manager struct {
-	mu       sync.RWMutex
-	settings Settings
-	dataDir  string
+	sessionMu sync.RWMutex
+	portable  bool
+	mu        sync.RWMutex
+	settings  Settings
+	dataDir   string
 }
 
-// NewManager 初始化数据目录并加载设置（YAML）。
-// 迁移策略：config.yaml 存在则加载；否则若旧 settings.json 存在则读入并写出 config.yaml，
-// 原文件重命名为 settings.json.bak；两者皆无则写出默认配置。
+// NewManager prefers an explicit portable directory. Existing installations keep
+// their original directory until the user moves it while the app is closed.
 func NewManager() (*Manager, error) {
-	base, err := os.UserConfigDir()
+	dir, portable, err := ResolveDataDir()
 	if err != nil {
 		return nil, err
 	}
-	return NewManagerAt(filepath.Join(base, "tdl-ui"))
+	return NewManagerForDataDir(dir, portable)
+}
+
+// ResolveDataDir selects the directory without opening sessions, profiles or
+// config files. The application can acquire exclusive use before initialization.
+func ResolveDataDir() (string, bool, error) {
+	if dir := os.Getenv("TDL_UI_DATA_DIR"); dir != "" {
+		if !filepath.IsAbs(dir) {
+			return "", false, errors.New("TDL_UI_DATA_DIR 必须是绝对路径")
+		}
+		return filepath.Clean(dir), false, nil
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return "", false, err
+	}
+	base, err := os.UserConfigDir()
+	if err != nil {
+		return "", false, err
+	}
+	return resolveDataDir(exe, base)
+}
+
+func NewManagerForDataDir(dir string, portable bool) (*Manager, error) {
+	m, err := NewManagerAt(dir)
+	if err != nil {
+		return nil, err
+	}
+	m.portable = portable
+	return m, nil
+}
+
+func resolveDataDir(exe, userConfig string) (string, bool, error) {
+	portable := filepath.Join(filepath.Dir(exe), "tdl-ui-data")
+	if info, err := os.Lstat(portable); err == nil {
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return "", false, errors.New("便携数据目录必须是普通目录")
+		}
+		return portable, true, nil
+	} else if !os.IsNotExist(err) {
+		return "", false, err
+	}
+	legacy := filepath.Join(userConfig, "tdl-ui")
+	for _, name := range []string{pendingCleanupName, ".instance.lock", "config.yaml", "settings.json", "kv", "tasks.db"} {
+		if _, err := os.Lstat(filepath.Join(legacy, name)); err == nil {
+			return legacy, false, nil
+		} else if !os.IsNotExist(err) {
+			// A Windows delete-pending coordination file still identifies this
+			// directory; Acquire will wait until its current owner releases it.
+			if name == ".instance.lock" {
+				return legacy, false, nil
+			}
+			return "", false, err
+		}
+	}
+	// Failure to create a portable directory is surfaced; never silently put a
+	// second copy of the login session in a different location.
+	return portable, true, nil
 }
 
 // NewManagerAt 在指定数据目录初始化配置（测试与自定义部署入口）。
 func NewManagerAt(dataDir string) (*Manager, error) {
+	if err := safeio.CheckPath(dataDir); err != nil {
+		return nil, err
+	}
+	if err := safeio.MkdirPrivate(dataDir); err != nil {
+		return nil, err
+	}
 	for _, dir := range []string{
 		dataDir,
 		filepath.Join(dataDir, "kv"),
 		filepath.Join(dataDir, "scripts"),
 		filepath.Join(dataDir, "cache"),
 		filepath.Join(dataDir, "tmp"),
+		filepath.Join(dataDir, "webview"),
+		filepath.Join(dataDir, "logs"),
 	} {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
+		if err := safeio.CheckPath(dir); err != nil {
+			return nil, err
+		}
+		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return nil, err
 		}
 	}
 
+	abs, err := filepath.Abs(dataDir)
+	if err != nil {
+		return nil, err
+	}
+	dataDir = abs
 	m := &Manager{dataDir: dataDir, settings: defaultSettings(dataDir)}
 	if err := m.loadOrMigrate(); err != nil {
 		return nil, err
+	}
+	if cleaned, err := m.resumeCleanup(); err != nil {
+		return nil, errors.Wrap(err, "上次确认的退出清理未完成")
+	} else if cleaned {
+		return NewManagerAt(dataDir)
 	}
 	return m, nil
 }
@@ -258,21 +370,31 @@ func defaultSettings(dataDir string) Settings {
 		downloadDir = filepath.Join(home, "Downloads", "tdl-ui")
 	}
 	return Settings{
-		Proxy:       "",
-		ProxyMode:   ProxyModeSystem,
-		DownloadDir: downloadDir,
-		Template:    DefaultTemplate,
-		Threads:     4,
-		Limit:       2,
-		PoolSize:    8,
-		Theme:       "system",
-		UI:          UISettings{LogFontSize: 14, ScrollbarSize: 10, MaxLogLines: 128},
-		Log:         logging.DefaultSettings(),
+		Proxy:               "",
+		ProxyMode:           ProxyModeSystem,
+		DownloadDir:         downloadDir,
+		Template:            DefaultTemplate,
+		NamingPolicyVersion: 1,
+		ConflictAction:      "skip",
+		ConflictCheck:       "origin",
+		Threads:             4,
+		Limit:               2,
+		PoolSize:            8,
+		Theme:               "system",
+		ExitAction:          "prompt",
+		UI:                  UISettings{LogFontSize: 14, ScrollbarSize: 10, MaxLogLines: 128},
+		Log:                 logging.LogSettings{Dir: filepath.Join(dataDir, "logs")}.WithDefaults(),
 	}
 }
 
 // DataDir 应用数据根目录。
 func (m *Manager) DataDir() string { return m.dataDir }
+
+// IsPortable 是否为便携模式。
+func (m *Manager) IsPortable() bool { return m.portable }
+
+// WebviewDataDir 返回 WebView2 运行时数据目录。
+func (m *Manager) WebviewDataDir() string { return filepath.Join(m.dataDir, "webview") }
 
 // KVDir bolt 存储目录（Telegram 会话等）。
 func (m *Manager) KVDir() string { return filepath.Join(m.dataDir, "kv") }
@@ -309,7 +431,7 @@ func (m *Manager) legacyJSONPath() string { return filepath.Join(m.dataDir, "set
 func (m *Manager) Get() Settings {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	return m.settings
+	return cloneSettings(m.settings)
 }
 
 // 参数上限（SVC-14）：防止前端传入夸张值拖垮连接池与 Telegram 限流。
@@ -319,7 +441,32 @@ const (
 )
 
 // Update 保存新的设置。
-func (m *Manager) Update(s Settings) error {
+func (m *Manager) Update(s Settings) error { return m.update(s, false) }
+
+// UpdatePreferences does not allow a stale or forged UI snapshot to overwrite
+// the authenticated identity or backend-owned script/history metadata.
+func (m *Manager) UpdatePreferences(s Settings) error { return m.update(s, true) }
+
+func (m *Manager) update(s Settings, preferencesOnly bool) error {
+	s = loadedDefaults(cloneSettings(s), m.dataDir)
+	if err := normalizePolicies(&s); err != nil {
+		return err
+	}
+	if preferencesOnly {
+		previous := m.Get()
+		for _, pair := range []struct{ next, old, standard string }{{s.CacheDir, previous.CacheDir, "cache"}, {s.TempDir, previous.TempDir, "tmp"}, {s.Log.Dir, previous.Log.Dir, "logs"}} {
+			if pair.next != "" && safeio.Within(m.dataDir, pair.next) && !safeio.Equal(pair.next, filepath.Join(m.dataDir, pair.standard)) && !safeio.Equal(pair.next, pair.old) {
+				return errors.New("自定义存储目录请放在应用数据目录外部，或使用对应的默认目录")
+			}
+			if pair.old != "" && safeio.Within(m.dataDir, pair.old) && !safeio.Equal(pair.old, filepath.Join(m.dataDir, pair.standard)) && !safeio.Equal(pair.old, pair.next) {
+				if entries, err := os.ReadDir(pair.old); err != nil && !os.IsNotExist(err) {
+					return err
+				} else if len(entries) > 0 {
+					return errors.New("旧自定义目录在应用数据目录内部且仍有内容，请先迁移该目录再修改设置")
+				}
+			}
+		}
+	}
 	// 空值兜底，避免前端传入非法配置
 	if s.Template == "" {
 		s.Template = DefaultTemplate
@@ -339,6 +486,9 @@ func (m *Manager) Update(s Settings) error {
 	}
 	if s.PoolSize > maxPoolSize {
 		s.PoolSize = maxPoolSize
+	}
+	if s.Log.Dir == "" {
+		s.Log.Dir = filepath.Join(m.dataDir, "logs")
 	}
 	s.Log = s.Log.WithDefaults()
 
@@ -378,6 +528,16 @@ func (m *Manager) Update(s Settings) error {
 	}
 
 	// 非空缓存目录：校验可创建且可写，失败则阻断保存。
+	for _, dir := range []string{s.DownloadDir, s.CacheDir, s.TempDir, s.Log.Dir} {
+		if dir != "" {
+			if err := safeio.CheckPath(dir); err != nil {
+				return err
+			}
+		}
+	}
+	if err := m.validateCachePaths(s); err != nil {
+		return err
+	}
 	if s.CacheDir != "" {
 		if err := verifyWritableDir(s.CacheDir); err != nil {
 			return err
@@ -392,9 +552,22 @@ func (m *Manager) Update(s Settings) error {
 	}
 
 	m.mu.Lock()
+	defer m.mu.Unlock()
+	previous := m.settings
+	if preferencesOnly {
+		s.NamingPolicyVersion = previous.NamingPolicyVersion
+		s.LoggedInUserID = previous.LoggedInUserID
+		s.LoggedInUsername = previous.LoggedInUsername
+		s.EnabledScripts = append([]string(nil), previous.EnabledScripts...)
+		s.TemplatesSeeded = previous.TemplatesSeeded
+		s.RecentDirs = cloneSettings(previous).RecentDirs
+	}
 	m.settings = s
-	m.mu.Unlock()
-	return m.save()
+	if err := m.save(); err != nil {
+		m.settings = previous
+		return err
+	}
+	return nil
 }
 
 // systemProxyEnvKeys 系统代理模式依次探测的环境变量（首个非空值生效）。
@@ -444,11 +617,18 @@ func VerifyWritableDir(dir string) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	probe := filepath.Join(dir, ".tdl-write-test")
-	if err := os.WriteFile(probe, []byte("ok"), 0o644); err != nil {
+	probe, err := os.CreateTemp(dir, ".tdl-write-test-*")
+	if err != nil {
 		return err
 	}
-	_ = os.Remove(probe)
+	name := probe.Name()
+	if err := probe.Close(); err != nil {
+		_ = os.Remove(name)
+		return err
+	}
+	if err := os.Remove(name); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -492,8 +672,15 @@ func (m *Manager) applyYAML(b []byte) error {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.settings = yamlToSettings(y)
+	m.settings = loadedDefaults(yamlToSettings(y), m.dataDir)
+	if err := normalizePolicies(&m.settings); err != nil {
+		return err
+	}
+	if m.settings.Log.Dir == "" {
+		m.settings.Log.Dir = filepath.Join(m.dataDir, "logs")
+	}
 	m.settings.Log = m.settings.Log.WithDefaults()
+	m.settings = loadedDefaults(m.settings, m.dataDir)
 	m.settings.UI = m.settings.UI.withDefaults()
 	return nil
 }
@@ -501,10 +688,18 @@ func (m *Manager) applyYAML(b []byte) error {
 func (m *Manager) applyLegacyJSON(b []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.settings.NamingPolicyVersion = 0
 	if err := legacyJSONUnmarshal(b, &m.settings); err != nil {
 		return err
 	}
+	if err := normalizePolicies(&m.settings); err != nil {
+		return err
+	}
+	if m.settings.Log.Dir == "" {
+		m.settings.Log.Dir = filepath.Join(m.dataDir, "logs")
+	}
 	m.settings.Log = m.settings.Log.WithDefaults()
+	m.settings = loadedDefaults(m.settings, m.dataDir)
 	m.settings.UI = m.settings.UI.withDefaults()
 	return nil
 }
@@ -515,7 +710,27 @@ func (m *Manager) save() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(m.configPath(), b, 0o644)
+	f, err := os.CreateTemp(m.dataDir, ".config-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name())
+	if err := f.Chmod(0o600); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if _, err := f.Write(b); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(f.Name(), m.configPath())
 }
 
 // saveLocked 在已持有写锁时调用，避免 RLock 死锁。
@@ -529,7 +744,7 @@ func (m *Manager) saveLocked() error {
 const MaxRecentDirs = 3
 
 var recentDirKinds = map[string]struct{}{
-	"download": {}, "logExport": {}, "cache": {}, "temp": {}, "logDir": {},
+	"download": {}, "logExport": {}, "cache": {}, "temp": {}, "logDir": {}, "manifest": {},
 }
 
 // RecentDirs 返回指定用途的最近目录历史。
@@ -539,7 +754,7 @@ func (m *Manager) RecentDirs(kind string) []string {
 	if m.settings.RecentDirs == nil {
 		return nil
 	}
-	return m.settings.RecentDirs[kind]
+	return append([]string(nil), m.settings.RecentDirs[kind]...)
 }
 
 // AddRecentDir 将目录加入指定用途的最近历史（去重、置顶、裁剪）。
@@ -612,4 +827,91 @@ func (m *Manager) MarkTemplatesSeeded() error {
 	defer m.mu.Unlock()
 	m.settings.TemplatesSeeded = true
 	return m.saveLocked()
+}
+
+// normalizePolicies rejects unknown values before any filesystem mutation.
+func normalizePolicies(s *Settings) error {
+	if s.ConflictAction == "" {
+		s.ConflictAction = "skip"
+	}
+	switch s.ConflictAction {
+	case "skip", "overwrite", "rename":
+	default:
+		return errors.New("同名策略无效")
+	}
+	if s.ConflictCheck == "" {
+		s.ConflictCheck = "origin"
+	}
+	switch s.ConflictCheck {
+	case "target", "origin":
+	default:
+		return errors.New("同名判定依据无效")
+	}
+	if s.ExitAction == "" {
+		s.ExitAction = "prompt"
+	}
+	switch s.ExitAction {
+	case "prompt", "direct", "clean_cache":
+	default:
+		return errors.New("退出策略无效；清除应用数据必须每次确认")
+	}
+	return nil
+}
+
+func cloneSettings(s Settings) Settings {
+	s.EnabledScripts = append([]string(nil), s.EnabledScripts...)
+	if s.RecentDirs != nil {
+		dirs := make(map[string][]string, len(s.RecentDirs))
+		for kind, list := range s.RecentDirs {
+			dirs[kind] = append([]string(nil), list...)
+		}
+		s.RecentDirs = dirs
+	}
+	return s
+}
+
+// Older or partial YAML files must not make a blank download directory resolve
+// to the process working directory, or create an unbounded worker pool.
+func loadedDefaults(s Settings, dataDir string) Settings {
+	if s.NamingPolicyVersion < 1 {
+		if s.Template == LegacyDefaultTemplate {
+			s.Template = DefaultTemplate
+		}
+		if s.ConflictCheck == "" || s.ConflictCheck == "target" {
+			s.ConflictCheck = "origin"
+		}
+		s.NamingPolicyVersion = 1
+	}
+	defaults := defaultSettings(dataDir)
+	if s.DownloadDir == "" {
+		s.DownloadDir = defaults.DownloadDir
+	}
+	if s.Template == "" {
+		s.Template = DefaultTemplate
+	}
+	if s.Threads <= 0 {
+		s.Threads = 4
+	}
+	if s.Threads > maxThreads {
+		s.Threads = maxThreads
+	}
+	if s.Limit <= 0 {
+		s.Limit = 2
+	}
+	if s.Limit > 16 {
+		s.Limit = 16
+	}
+	if s.PoolSize <= 0 {
+		s.PoolSize = 8
+	}
+	if s.PoolSize > maxPoolSize {
+		s.PoolSize = maxPoolSize
+	}
+	if s.Theme == "" {
+		s.Theme = "system"
+	}
+	if s.ProxyMode == "" {
+		s.ProxyMode = ProxyModeSystem
+	}
+	return s
 }

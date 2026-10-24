@@ -31,14 +31,14 @@ tdl UI：基于 Wails v2 的 Telegram 媒体下载桌面客户端，复用 tdl�
 | 层 | 技术 |
 | --- | --- |
 | 桌面壳 | Wails v2（Go ↔ WebView 绑定 + 事件） |
-| 后端 | Go 1.25+；`go.mod replace github.com/iyear/tdl => ../ref/tdl` |
+| 后端 | Go 1.26+（发布构建使用已修复漏洞的当前工具链）；`go.mod replace github.com/iyear/tdl => ../ref/tdl` |
 | 下载引擎 | tdl `core/downloader` + `core/dcpool` + `pkg/tclient`（bolt 会话存储 `pkg/kv`） |
 | 脚本引擎 | Yaegi（Go 解释器），沙箱禁用 `os/exec` |
 | 前端 | Vue 3 + Vite + PrimeVue 4（Aura 主题）+ Pinia + vue-router，pnpm 管理 |
 
 ## 后端模块（src/internal/）
 
-- `config/` — 设置持久化（`%AppData%\tdl-ui\config.yaml`）
+- `config/` — 设置持久化（`<DataDir>/config.yaml`，兼容旧数据目录）
 - `events/` — Wails 事件契约：`login:update`、`task:update`、`task:file`、`script:log`、`log:batch`
 - `scriptapi/` — 脚本可见的 API 类型（FileInfo/TaskInfo/Log/Logf）
 - `script/` — Yaegi 引擎封装（契约函数提取、panic 恢复、10 秒超时保护）+ 脚本文件 CRUD + 内置模板（`script/templates/`）

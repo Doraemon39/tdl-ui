@@ -81,6 +81,7 @@ func newProgress(task *Task, it *iter, rewriteExt bool, emitInterval time.Durati
 
 func (p *progress) OnAdd(elem downloader.Elem) {
 	e := elem.(*iterElem)
+	p.task.setActivity("")
 	p.task.addFile(TaskFile{
 		Name:         e.targetName,
 		Path:         e.to.Name(),

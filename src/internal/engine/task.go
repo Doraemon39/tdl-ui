@@ -89,6 +89,7 @@ type TaskView struct {
 	Status     string   `json:"status"`
 	Error      string   `json:"error,omitempty"`
 	Notice     string   `json:"notice,omitempty"`
+	Activity   string   `json:"activity,omitempty"`
 	Total      int      `json:"total"`
 	Finished   int      `json:"finished"`
 	Failed     int      `json:"failed"`
@@ -118,6 +119,7 @@ type Task struct {
 	mu           sync.Mutex
 	status       string
 	errMsg       string
+	activity     string
 	total        int
 	finished     int
 	failed       int
@@ -181,6 +183,7 @@ func (t *Task) view() TaskView {
 		Status:     t.status,
 		Error:      errMsg,
 		Notice:     notice,
+		Activity:   t.activity,
 		Total:      t.total,
 		Finished:   t.finished,
 		Failed:     t.failed,
@@ -206,6 +209,17 @@ func (t *Task) info() scriptapi.TaskInfo {
 func (t *Task) emitUpdate() {
 	t.persistState()
 	t.mgr.deps.Emitter.Emit(events.Task, t.view())
+}
+
+func (t *Task) setActivity(activity string) {
+	t.mu.Lock()
+	if t.status != StatusRunning || t.activity == activity {
+		t.mu.Unlock()
+		return
+	}
+	t.activity = activity
+	t.mu.Unlock()
+	t.emitUpdate()
 }
 
 func (t *Task) emitFile(ev FileEvent) {

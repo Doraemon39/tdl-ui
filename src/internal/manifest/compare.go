@@ -1,6 +1,7 @@
 package manifest
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -142,7 +143,11 @@ func Compare(dir string, entries []Entry, known map[string]LocalMatch, key func(
 func EntryKey(e Entry) string { return strconv.Itoa(e.MessageID) }
 
 func VerifyDigest(root *os.Root, path string, size int64, digest string) bool {
-	if len(digest) != 64 || !RegularFile(root, path, size) {
+	return VerifyDigestContext(context.Background(), root, path, size, digest)
+}
+
+func VerifyDigestContext(ctx context.Context, root *os.Root, path string, size int64, digest string) bool {
+	if ctx.Err() != nil || len(digest) != 64 || !RegularFile(root, path, size) {
 		return false
 	}
 	f, err := root.Open(path)
@@ -151,6 +156,18 @@ func VerifyDigest(root *os.Root, path string, size int64, digest string) bool {
 	}
 	defer f.Close()
 	h := sha256.New()
-	n, err := io.Copy(h, f)
-	return err == nil && n == size && hex.EncodeToString(h.Sum(nil)) == digest
+	n, err := io.Copy(h, digestReader{ctx: ctx, reader: f})
+	return err == nil && ctx.Err() == nil && n == size && hex.EncodeToString(h.Sum(nil)) == digest
+}
+
+type digestReader struct {
+	ctx    context.Context
+	reader io.Reader
+}
+
+func (r digestReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.reader.Read(p)
 }

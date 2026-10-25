@@ -13,19 +13,43 @@ import (
 func (t *Task) recordCompletion(dialogID int64, typ string, entry manifest.Entry) (string, error) {
 	t.manifestMu.Lock()
 	defer t.manifestMu.Unlock()
+	s, err := t.completionSession(dialogID, typ, true)
+	if err != nil {
+		return "", t.recordManifestError(err)
+	}
+	path := s.Path()
+	if err := s.MarkDone(entry); err != nil {
+		return path, t.recordManifestError(err)
+	}
+	return path, nil
+}
+
+func (t *Task) completionRecorded(dialogID int64, typ string, entry manifest.Entry) bool {
+	t.manifestMu.Lock()
+	defer t.manifestMu.Unlock()
+	s, err := t.completionSession(dialogID, typ, false)
+	return err == nil && s.HasCompletion(dialogID, typ, entry)
+}
+
+// Caller holds manifestMu. Sessions are scoped to the run, not the import cache.
+func (t *Task) completionSession(dialogID int64, typ string, create bool) (*manifest.Session, error) {
 	s := t.manifest
 	if s == nil || !s.MatchesSource(dialogID, typ) {
 		key := fmt.Sprintf("%s:%d", manifest.Namespace(typ), dialogID)
 		s = t.completionManifests[key]
 		if s == nil {
 			var err error
-			// Automatic journals belong to this run. Do not consume the bounded
-			// registry used by explicit manifest imports for the app's lifetime.
-			s, err = manifest.NewRegistry().OpenTask(t.opts.Dir, t.ID, manifest.Header{
+			header := manifest.Header{
 				AccountID: t.opts.AccountID, DialogID: dialogID, DialogType: typ, Title: t.opts.Label,
-			})
+			}
+			r := manifest.NewRegistry()
+			if create {
+				s, err = r.OpenTask(t.opts.Dir, t.ID, header)
+			} else {
+				s, err = r.OpenExistingTask(t.opts.Dir, t.ID, header)
+			}
 			if err != nil {
-				return "", t.recordManifestError(err)
+				return nil, err
 			}
 			if t.completionManifests == nil {
 				t.completionManifests = map[string]*manifest.Session{}
@@ -33,11 +57,7 @@ func (t *Task) recordCompletion(dialogID int64, typ string, entry manifest.Entry
 			t.completionManifests[key] = s
 		}
 	}
-	path := s.Path()
-	if err := s.MarkDone(entry); err != nil {
-		return path, t.recordManifestError(err)
-	}
-	return path, nil
+	return s, nil
 }
 
 func (t *Task) recordManifestError(err error) error {

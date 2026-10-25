@@ -39,6 +39,7 @@ func (m *Manager) run(t *Task) {
 	t.cancel = cancel
 	t.runDone = runDone
 	t.status = StatusRunning
+	t.activity = "正在连接 Telegram…"
 	t.mu.Unlock()
 	logEngine.Infof("任务开始运行: id=%s", t.ID)
 	t.emitUpdate()
@@ -81,6 +82,7 @@ func (m *Manager) run(t *Task) {
 	}
 
 	t.mu.Lock()
+	t.activity = ""
 	switch {
 	case notice != "":
 		t.status = StatusDone
@@ -200,6 +202,7 @@ func (m *Manager) execute(ctx context.Context, t *Task) (rerr error) {
 		if self.ID != t.opts.AccountID {
 			return errors.New("实际登录账号与任务归属不一致，已停止下载")
 		}
+		t.setActivity("正在核对已有下载记录…")
 		pool := dcpool.NewPool(c,
 			int64(settings.PoolSize),
 			coretclient.NewDefaultMiddlewares(ctx, reconnectTimeout)...)
@@ -238,7 +241,8 @@ func (m *Manager) execute(ctx context.Context, t *Task) (rerr error) {
 			return err
 		}
 		it, err := newIter(pool, manager, dialogs, IterOptions{
-			Disk: guard,
+			CompletionRecorded: t.completionRecorded,
+			Disk:               guard,
 			OnLocalDone: func(dialogID int64, typ string, entry manifest.Entry) error {
 				_, err := t.recordCompletion(dialogID, typ, entry)
 				return err

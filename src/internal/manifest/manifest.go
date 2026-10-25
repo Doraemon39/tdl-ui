@@ -214,6 +214,19 @@ func (s *Session) ShouldSkip(dialog int64, typ string, id int, media string, siz
 	return ok && dialog == s.info.Header.DialogID && Namespace(typ) != "" && Namespace(typ) == Namespace(s.info.Header.DialogType) && e.MediaID == media && media != "" && e.Size == size && validEntry(e)
 }
 
+// HasCompletion checks whether a task's already completed file needs a journal
+// repair. It does not validate a new local-file match or read media contents.
+func (s *Session) HasCompletion(dialog int64, typ string, entry Entry) bool {
+	if s == nil || len(entry.SHA256) != 64 || !validEntry(entry) {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.entries[entry.MessageID]
+	return ok && dialog == s.info.Header.DialogID && Namespace(typ) != "" && Namespace(typ) == Namespace(s.info.Header.DialogType) && validEntry(e) &&
+		e.MediaID == entry.MediaID && e.Name == entry.Name && e.Size == entry.Size && e.Date == entry.Date && e.SHA256 == entry.SHA256 && e.SavedName == entry.SavedName
+}
+
 func (s *Session) MarkDone(e Entry) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -235,13 +248,22 @@ func (r *Registry) Create(dir string, h Header, entries []Entry) (Info, error) {
 // OpenTask keeps automatic completion journals stable across pause/resume and
 // application restarts without needing a second source of task metadata.
 func (r *Registry) OpenTask(dir, taskID string, h Header) (*Session, error) {
+	return r.openTask(dir, taskID, h, true)
+}
+
+// OpenExistingTask never creates an empty journal during a resume check.
+func (r *Registry) OpenExistingTask(dir, taskID string, h Header) (*Session, error) {
+	return r.openTask(dir, taskID, h, false)
+}
+
+func (r *Registry) openTask(dir, taskID string, h Header, create bool) (*Session, error) {
 	if taskID == "" || filepath.Base(taskID) != taskID || !filepath.IsLocal(taskID) {
 		return nil, errors.New("自动清单任务标识无效")
 	}
 	name := "tdl-media-" + Namespace(h.DialogType) + "-" + strconv.FormatInt(h.DialogID, 10) + "-" + taskID + ".jsonl"
 	path := filepath.Join(dir, name)
 	s, err := r.Open(path, h.AccountID)
-	if os.IsNotExist(err) {
+	if os.IsNotExist(err) && create {
 		_, err = r.create(dir, h, nil, name)
 		if err != nil && !os.IsExist(err) {
 			return nil, err

@@ -187,6 +187,7 @@
         <span>{{ t.createdAt }}</span>
       </div>
 
+      <Message v-if="t.status === 'running' && t.activity" severity="info" class="mt-8" size="small">{{ t.activity }}</Message>
       <Message v-if="t.error" severity="error" class="mt-8" size="small">{{ t.error }}</Message>
       <Message v-if="t.notice" severity="warn" class="mt-8" size="small" style="white-space: pre-wrap; overflow-wrap: anywhere">{{ t.notice }}</Message>
 

@@ -49,27 +49,28 @@ type fileTemplate struct {
 
 // IterOptions 迭代器装配参数。
 type IterOptions struct {
-	Disk           *diskGuard
-	OnLocalDone    func(dialogID int64, typ string, entry manifest.Entry) error
-	LocalMatches   map[string]manifest.LocalMatch
-	RecordManifest bool
-	Manifest       *manifest.Session
-	ManifestMode   string
-	SingleKeys     map[string]bool
-	Dir            string
-	RewriteExt     bool
-	SkipSame       bool
-	ConflictAction string
-	ConflictCheck  string
-	KnownOrigins   map[string]string
-	Outputs        *outputCoordinator
-	Template       string
-	Group          bool
-	Contracts      *script.Contracts // 可选：过滤/命名脚本契约
-	TargetNames    map[string]string
-	OverwriteKeys  map[string]bool
-	Renames        map[int]string // 可选：手动重命名映射（messageId → 自定义文件名，不含扩展名）
-	OnSkip         func(info scriptapi.FileInfo, name, reason, dialogType string)
+	CompletionRecorded func(dialogID int64, typ string, entry manifest.Entry) bool
+	Disk               *diskGuard
+	OnLocalDone        func(dialogID int64, typ string, entry manifest.Entry) error
+	LocalMatches       map[string]manifest.LocalMatch
+	RecordManifest     bool
+	Manifest           *manifest.Session
+	ManifestMode       string
+	SingleKeys         map[string]bool
+	Dir                string
+	RewriteExt         bool
+	SkipSame           bool
+	ConflictAction     string
+	ConflictCheck      string
+	KnownOrigins       map[string]string
+	Outputs            *outputCoordinator
+	Template           string
+	Group              bool
+	Contracts          *script.Contracts // 可选：过滤/命名脚本契约
+	TargetNames        map[string]string
+	OverwriteKeys      map[string]bool
+	Renames            map[int]string // 可选：手动重命名映射（messageId → 自定义文件名，不含扩展名）
+	OnSkip             func(info scriptapi.FileInfo, name, reason, dialogType string)
 	// OnTotalDecr 消息被跳过（无媒体/已删除/被过滤/同名同大小）时回调，
 	// 供消费方递减 total，避免任务 Done 后进度仍显示 12/20（ENG-06）。
 	// 注：断点命中的跳过已计入 finished，不触发此回调。
@@ -185,6 +186,10 @@ func (i *iter) Next(ctx context.Context) bool {
 	}
 
 	for {
+		if err := ctx.Err(); err != nil {
+			i.setErr(err)
+			return false
+		}
 		ok, skip := i.process(ctx)
 		if skip {
 			continue
@@ -281,8 +286,18 @@ func (i *iter) processSingle(ctx context.Context, message *tg.Message, from peer
 	if i.isFinished(key) {
 		// A previous run may have published the file before its journal write
 		// failed. Repair that record before treating the resume key as settled.
-		if match, ok := i.opts.LocalMatches[key]; ok && match.Entry.MediaID == MediaIdentity(message) && match.Entry.Name == item.Name && match.Entry.Size == item.Size && manifest.VerifyDigest(i.root, match.Path, item.Size, match.Entry.SHA256) {
-			if err := i.recordLocalDone(info, peerDialogType(from), match); err != nil {
+		if match, ok := i.opts.LocalMatches[key]; ok && match.Entry.MediaID == MediaIdentity(message) && match.Entry.Name == item.Name && match.Entry.Size == item.Size {
+			entry := localCompletionEntry(info, match)
+			typ := peerDialogType(from)
+			if i.opts.Manifest.HasCompletion(info.DialogID, typ, entry) || i.opts.CompletionRecorded != nil && i.opts.CompletionRecorded(info.DialogID, typ, entry) {
+				return false, true
+			}
+			if manifest.VerifyDigestContext(ctx, i.root, match.Path, item.Size, match.Entry.SHA256) {
+				if err := i.recordLocalDone(info, typ, match); err != nil {
+					i.setErr(err)
+					return false, false
+				}
+			} else if err := ctx.Err(); err != nil {
 				i.setErr(err)
 				return false, false
 			}
@@ -295,13 +310,17 @@ func (i *iter) processSingle(ctx context.Context, message *tg.Message, from peer
 		return false, true
 	}
 	if i.opts.ConflictAction == "smart" {
-		if match, ok := i.opts.LocalMatches[key]; ok && match.Entry.MediaID == MediaIdentity(message) && match.Entry.Name == item.Name && match.Entry.Size == item.Size && manifest.VerifyDigest(i.root, match.Path, item.Size, match.Entry.SHA256) {
+		if match, ok := i.opts.LocalMatches[key]; ok && match.Entry.MediaID == MediaIdentity(message) && match.Entry.Name == item.Name && match.Entry.Size == item.Size && manifest.VerifyDigestContext(ctx, i.root, match.Path, item.Size, match.Entry.SHA256) {
 			if err := i.recordLocalDone(info, peerDialogType(from), match); err != nil {
 				i.setErr(err)
 				return false, false
 			}
 			i.notifySkip(info, info.FileName, "本地已有：原名、大小及来源比对通过", peerDialogType(from))
 			return false, true
+		}
+		if err := ctx.Err(); err != nil {
+			i.setErr(err)
+			return false, false
 		}
 	}
 	// 脚本过滤：返回 false 则跳过该文件
@@ -380,11 +399,16 @@ func (i *iter) processSingle(ctx context.Context, message *tg.Message, from peer
 	return true, false
 }
 
-func (i *iter) recordLocalDone(info scriptapi.FileInfo, typ string, match manifest.LocalMatch) error {
+func localCompletionEntry(info scriptapi.FileInfo, match manifest.LocalMatch) manifest.Entry {
 	entry := match.Entry
 	entry.Date = info.MessageDate
 	entry.SavedName = filepath.Base(match.Path)
 	entry.Evidence = "source"
+	return entry
+}
+
+func (i *iter) recordLocalDone(info scriptapi.FileInfo, typ string, match manifest.LocalMatch) error {
+	entry := localCompletionEntry(info, match)
 	if i.opts.OnLocalDone != nil {
 		return i.opts.OnLocalDone(info.DialogID, typ, entry)
 	}

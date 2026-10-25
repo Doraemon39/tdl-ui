@@ -89,3 +89,5 @@ Please read the [disclaimer](DISCLAIMER.md) before use: this tool is for lawful 
 Portable storage, media selection, scoped re-downloads, and cleanup boundaries are documented in [the change and validation notes](doc/audit/2026-10-25-patch-hardening.md). On Windows, run `./build.ps1` from `src/` to use the project-local build tool.
 
 Downloaded manifests contain confirmed local matches only. Ambiguous duplicate names are excluded. Downloads use original filenames and preserve unconfirmed collisions with numbered suffixes. See the [download guide](doc/tutorials/intermediate/01-download.md).
+
+Downloads stop and finish the current task at a configurable disk usage limit (90% by default). Completed files are appended to the selected manifest, or recorded in automatic manifests in the download directory. Import the manifest and select the original download range again after freeing disk space to continue.

@@ -9,6 +9,7 @@ const defaults = (): Settings =>
     proxy: '',
     proxyMode: 'system',
     downloadDir: '',
+    diskUsageLimit: 90,
     template: '',
     conflictAction: 'skip',
     conflictCheck: 'origin',

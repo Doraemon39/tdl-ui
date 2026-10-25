@@ -73,6 +73,11 @@
           <InputNumber id="pool" v-model="store.settings.poolSize" :min="1" :max="32" show-buttons fluid />
         </div>
       </div>
+      <div class="form-field">
+        <label for="disk-usage-limit">磁盘使用率上限</label>
+        <InputNumber input-id="disk-usage-limit" v-model="store.settings.diskUsageLimit" :min="1" :max="99" suffix="%" show-buttons fluid />
+        <span class="hint">默认 90%，对下次启动或恢复的任务生效。下载目录所在磁盘达到上限或下一次写入将超限时，自动停止并完成本次任务。已下载项追加到所选清单；未选清单时，自动在下载目录按对话记录清单。清理空间后，导入清单并重新选择原下载范围，继续剩余文件。</span>
+      </div>
 
       <h2 class="section-title">界面</h2>
       <div class="form-field">

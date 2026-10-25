@@ -90,6 +90,7 @@
         <Button v-if="selection" label="新建清单" icon="pi pi-plus" severity="secondary" outlined :disabled="creating" @click="newManifest" />
         <Button v-if="selectedManifest" label="解除清单" severity="secondary" text :disabled="creating" @click="setManifest(null)" />
       </div>
+      <span class="manifest-hint">磁盘使用率上限为 {{ settings.settings.diskUsageLimit }}%。达到上限时自动停止并完成本次任务。未选清单时，已下载项自动记录到下载目录中的清单，清理空间后可导入继续。</span>
       <template v-if="selectedManifest">
         <div class="manifest-card">
           <div class="manifest-card-title">

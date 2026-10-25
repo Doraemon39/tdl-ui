@@ -31,11 +31,17 @@ type iterElem struct {
 	outputAction string
 
 	takeout bool
+	disk    *diskGuard
 }
 
 func (i *iterElem) File() downloader.File { return i }
 
-func (i *iterElem) To() io.WriterAt { return i.to }
+func (i *iterElem) To() io.WriterAt {
+	if i.disk != nil {
+		return diskWriter{file: i.to, guard: i.disk}
+	}
+	return i.to
+}
 
 func (i *iterElem) AsTakeout() bool { return i.takeout }
 

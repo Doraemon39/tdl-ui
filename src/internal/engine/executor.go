@@ -15,6 +15,7 @@ import (
 	"github.com/iyear/tdl/pkg/tmessage"
 
 	"tdl-ui/internal/config"
+	"tdl-ui/internal/manifest"
 	"tdl-ui/internal/scriptapi"
 	"tdl-ui/internal/store"
 )
@@ -50,12 +51,32 @@ func (m *Manager) run(t *Task) {
 	}
 	err := exec(ctx, t)
 	cancel()
+	var diskLimit *diskLimitError
+	if errors.As(err, &diskLimit) {
+		t.mu.Lock()
+		manifestError := t.manifestError
+		failed := t.failed
+		t.mu.Unlock()
+		if manifestError != "" {
+			err = errors.New(err.Error() + "\n文件已保存，但清单未能更新：" + manifestError)
+		} else if failed > 0 {
+			err = errors.New(err.Error() + "\n部分文件未能完成保存，请查看失败记录后重试")
+		}
+	}
+	notice := ""
+	if errors.As(err, &diskLimit) {
+		notice = t.diskStopNotice(err)
+	}
 
 	t.mu.Lock()
 	t.cancel = nil
 	switch {
+	case notice != "":
+		t.status = StatusDone
+		t.errMsg = notice
 	case err == nil:
 		t.status = StatusDone
+		t.errMsg = ""
 	case errors.Is(err, context.Canceled):
 		if t.paused {
 			t.status = StatusPaused
@@ -77,9 +98,12 @@ func (m *Manager) run(t *Task) {
 
 	t.emitUpdate()
 	_ = t.contracts.SafeOnTaskDone(t.info())
+	t.manifestMu.Lock()
+	t.manifest = nil
+	t.completionManifests = nil
+	t.manifestMu.Unlock()
 	t.mu.Lock()
 	t.runDone = nil
-	t.manifest = nil
 	t.mu.Unlock()
 	close(runDone)
 }
@@ -99,7 +123,7 @@ func (m *Manager) execute(ctx context.Context, t *Task) (rerr error) {
 	if m.deps.Cfg != nil {
 		settings = m.deps.Cfg.Get()
 	} else {
-		settings = config.Settings{Threads: 4, Limit: 2, ProgressIntervalMs: 500}
+		settings = config.Settings{Threads: 4, Limit: 2, ProgressIntervalMs: 500, DiskUsageLimit: 90}
 	}
 	if t.opts.ManifestPath != "" {
 		session, err := m.manifests.Open(t.opts.ManifestPath, settings.LoggedInUserID)
@@ -114,6 +138,18 @@ func (m *Manager) execute(ctx context.Context, t *Task) (rerr error) {
 	if m.deps.Cfg != nil && (t.opts.AccountID <= 0 || t.opts.AccountID != settings.LoggedInUserID) {
 		return errors.New("任务账号与当前会话不一致，请重新选择来源")
 	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	guard := &diskGuard{dir: t.opts.Dir, limit: settings.DiskUsageLimit, ctx: ctx, cancel: cancel, space: readDiskSpace}
+	defer func() {
+		if guardErr := guard.Err(); guardErr != nil && (rerr == nil || errors.Is(rerr, context.Canceled)) {
+			rerr = guardErr
+		}
+	}()
+	if err := guard.check(0); err != nil {
+		return err
+	}
+	defer guard.watch()()
 
 	// 每轮从 task_items 表重组装 URLs/Selections，与持久化的消息项保持一致。
 	urls, selections := t.opts.URLs, t.opts.Selections
@@ -191,6 +227,11 @@ func (m *Manager) execute(ctx context.Context, t *Task) (rerr error) {
 			return err
 		}
 		it, err := newIter(pool, manager, dialogs, IterOptions{
+			Disk: guard,
+			OnLocalDone: func(dialogID int64, typ string, entry manifest.Entry) error {
+				_, err := t.recordCompletion(dialogID, typ, entry)
+				return err
+			},
 			OverwriteKeys: t.opts.OverwriteKeys,
 			LocalMatches:  localMatches, RecordManifest: t.opts.RecordManifest,
 			Dir: t.opts.Dir, SingleKeys: single, Manifest: t.manifest, ManifestMode: t.opts.ManifestMode,
@@ -281,11 +322,14 @@ func (m *Manager) execute(ctx context.Context, t *Task) (rerr error) {
 		derr := downloader.New(downloader.Options{
 			Pool:    pool,
 			Threads: settings.Threads,
-			Iter:    it,
+			Iter:    settlingIter{it},
 			// 进度节流间隔可经配置调优，零值回退默认 200ms（ARC-003）
 			Progress: newProgress(t, it, t.opts.RewriteExt,
 				time.Duration(settings.ProgressIntervalMs)*time.Millisecond),
 		}).Download(ctx, settings.Limit)
+		if iterErr := it.Err(); iterErr != nil {
+			return iterErr
+		}
 		if derr == nil {
 			t.mu.Lock()
 			t.total = it.discovered

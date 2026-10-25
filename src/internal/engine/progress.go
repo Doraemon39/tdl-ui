@@ -177,27 +177,21 @@ func (p *progress) OnDone(elem downloader.Elem, err error) {
 
 	p.it.Finish(e.resumeKey)
 	p.task.saveResumeKey(e.resumeKey)
-	manifestError := ""
-	if p.task.opts.RecordManifest && p.task.manifest != nil && p.task.manifest.MatchesSource(e.info.DialogID, peerDialogType(e.from)) {
-		duplicates := p.it.duplicateCounts[e.info.FileName]
-		if duplicates < 2 {
-			duplicates = 0
-		}
-		if err := p.task.manifest.MarkDone(manifest.Entry{SHA256: digest, MessageID: e.info.MessageID, MediaID: MediaIdentity(e.fromMsg), Name: e.info.FileName, Size: e.file.Size, Date: e.info.MessageDate, SavedName: filepath.Base(newpath), DuplicateCount: duplicates}); err != nil {
-			manifestError = err.Error()
-			p.task.mu.Lock()
-			p.task.manifestError = manifestError
-			p.task.mu.Unlock()
-		}
+	manifestError, manifestPath := "", ""
+	duplicates := p.it.duplicateCounts[e.info.FileName]
+	if duplicates < 2 {
+		duplicates = 0
+	}
+	manifestPath, recordErr := p.task.recordCompletion(e.info.DialogID, peerDialogType(e.from), manifest.Entry{SHA256: digest, MessageID: e.info.MessageID, MediaID: MediaIdentity(e.fromMsg), Name: e.info.FileName, Size: e.file.Size, Date: e.info.MessageDate, SavedName: filepath.Base(newpath), DuplicateCount: duplicates})
+	if recordErr != nil {
+		manifestError = recordErr.Error()
 	}
 	p.task.onFileDone(e.info)
 	ev := p.buildEvent(e, e.file.Size, e.file.Size, "done", nil)
 	ev.Name = filepath.Base(newpath) // rewriteExt 可能改名，以最终文件名为准
 	ev.Path = newpath
-	if p.task.opts.RecordManifest {
-		ev.ManifestPath = p.task.opts.ManifestPath
-		ev.ManifestError = manifestError
-	}
+	ev.ManifestPath = manifestPath
+	ev.ManifestError = manifestError
 	ev.Speed = 0
 	p.clearSpeedSample(e.id)
 	p.task.emitFile(ev)

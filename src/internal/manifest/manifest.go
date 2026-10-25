@@ -193,6 +193,12 @@ func (s *Session) Info() Info {
 	i.Entries = append([]Entry{}, i.Entries...)
 	return i
 }
+
+func (s *Session) Path() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.info.Path
+}
 func (s *Session) MatchesSource(dialog int64, typ string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -223,6 +229,35 @@ func (s *Session) MarkDone(e Entry) error {
 
 // Create chooses a fresh name and never overwrites an existing user file.
 func (r *Registry) Create(dir string, h Header, entries []Entry) (Info, error) {
+	return r.create(dir, h, entries, "")
+}
+
+// OpenTask keeps automatic completion journals stable across pause/resume and
+// application restarts without needing a second source of task metadata.
+func (r *Registry) OpenTask(dir, taskID string, h Header) (*Session, error) {
+	if taskID == "" || filepath.Base(taskID) != taskID || !filepath.IsLocal(taskID) {
+		return nil, errors.New("自动清单任务标识无效")
+	}
+	name := "tdl-media-" + Namespace(h.DialogType) + "-" + strconv.FormatInt(h.DialogID, 10) + "-" + taskID + ".jsonl"
+	path := filepath.Join(dir, name)
+	s, err := r.Open(path, h.AccountID)
+	if os.IsNotExist(err) {
+		_, err = r.create(dir, h, nil, name)
+		if err != nil && !os.IsExist(err) {
+			return nil, err
+		}
+		s, err = r.Open(path, h.AccountID)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !s.MatchesSource(h.DialogID, h.DialogType) {
+		return nil, errors.New("自动清单来源不一致，拒绝追加")
+	}
+	return s, nil
+}
+
+func (r *Registry) create(dir string, h Header, entries []Entry, name string) (Info, error) {
 	var empty Info
 	if err := safeio.CheckPath(dir); err != nil {
 		return empty, err
@@ -250,7 +285,12 @@ func (r *Registry) Create(dir string, h Header, entries []Entry) (Info, error) {
 	if err != nil {
 		return empty, err
 	}
-	f, err := os.CreateTemp(dir, "tdl-media-"+strconv.FormatInt(h.DialogID, 10)+"-*.jsonl")
+	var f *os.File
+	if name == "" {
+		f, err = os.CreateTemp(dir, "tdl-media-"+strconv.FormatInt(h.DialogID, 10)+"-*.jsonl")
+	} else {
+		f, err = os.OpenFile(filepath.Join(dir, name), os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	}
 	if err != nil {
 		return empty, err
 	}

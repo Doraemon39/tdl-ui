@@ -188,6 +188,7 @@
       </div>
 
       <Message v-if="t.error" severity="error" class="mt-8" size="small">{{ t.error }}</Message>
+      <Message v-if="t.notice" severity="warn" class="mt-8" size="small" style="white-space: pre-wrap; overflow-wrap: anywhere">{{ t.notice }}</Message>
 
       <!-- 进行中的文件 -->
       <div v-for="f in tasks.filesOf(t.id)" :key="f.fileId" class="file-row">

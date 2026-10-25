@@ -49,6 +49,8 @@ type fileTemplate struct {
 
 // IterOptions 迭代器装配参数。
 type IterOptions struct {
+	Disk           *diskGuard
+	OnLocalDone    func(dialogID int64, typ string, entry manifest.Entry) error
 	LocalMatches   map[string]manifest.LocalMatch
 	RecordManifest bool
 	Manifest       *manifest.Session
@@ -268,9 +270,6 @@ func (i *iter) processSingle(ctx context.Context, message *tg.Message, from peer
 	}
 
 	i.discovered++
-	if i.isFinished(key) {
-		return false, true
-	}
 	info := scriptapi.FileInfo{
 		DialogID:    from.ID(),
 		MessageID:   message.ID,
@@ -279,6 +278,17 @@ func (i *iter) processSingle(ctx context.Context, message *tg.Message, from peer
 		FileCaption: message.Message,
 		FileSize:    item.Size,
 	}
+	if i.isFinished(key) {
+		// A previous run may have published the file before its journal write
+		// failed. Repair that record before treating the resume key as settled.
+		if match, ok := i.opts.LocalMatches[key]; ok && match.Entry.MediaID == MediaIdentity(message) && match.Entry.Name == item.Name && match.Entry.Size == item.Size && manifest.VerifyDigest(i.root, match.Path, item.Size, match.Entry.SHA256) {
+			if err := i.recordLocalDone(info, peerDialogType(from), match); err != nil {
+				i.setErr(err)
+				return false, false
+			}
+		}
+		return false, true
+	}
 
 	if i.opts.Manifest != nil && i.opts.Manifest.ShouldSkip(from.ID(), peerDialogType(from), message.ID, MediaIdentity(message), item.Size, i.opts.ManifestMode) {
 		i.notifySkip(info, info.FileName, "已在导入清单中，按清单跳过", peerDialogType(from))
@@ -286,13 +296,9 @@ func (i *iter) processSingle(ctx context.Context, message *tg.Message, from peer
 	}
 	if i.opts.ConflictAction == "smart" {
 		if match, ok := i.opts.LocalMatches[key]; ok && match.Entry.MediaID == MediaIdentity(message) && match.Entry.Name == item.Name && match.Entry.Size == item.Size && manifest.VerifyDigest(i.root, match.Path, item.Size, match.Entry.SHA256) {
-			if i.opts.Manifest != nil && i.opts.RecordManifest && i.opts.Manifest.MatchesSource(from.ID(), peerDialogType(from)) {
-				match.Entry.Date = int64(message.Date)
-				match.Entry.Evidence = "source"
-				if err := i.opts.Manifest.MarkDone(match.Entry); err != nil {
-					i.setErr(err)
-					return false, false
-				}
+			if err := i.recordLocalDone(info, peerDialogType(from), match); err != nil {
+				i.setErr(err)
+				return false, false
 			}
 			i.notifySkip(info, info.FileName, "本地已有：原名、大小及来源比对通过", peerDialogType(from))
 			return false, true
@@ -368,10 +374,32 @@ func (i *iter) processSingle(ctx context.Context, message *tg.Message, from peer
 		info:    info,
 
 		to: to, targetName: name, outputAction: action,
+		disk: i.opts.Disk,
 	}
 
 	return true, false
 }
+
+func (i *iter) recordLocalDone(info scriptapi.FileInfo, typ string, match manifest.LocalMatch) error {
+	entry := match.Entry
+	entry.Date = info.MessageDate
+	entry.SavedName = filepath.Base(match.Path)
+	entry.Evidence = "source"
+	if i.opts.OnLocalDone != nil {
+		return i.opts.OnLocalDone(info.DialogID, typ, entry)
+	}
+	if i.opts.Manifest != nil && i.opts.RecordManifest && i.opts.Manifest.MatchesSource(info.DialogID, typ) {
+		return i.opts.Manifest.MarkDone(entry)
+	}
+	return nil
+}
+
+// The upstream downloader returns early on Iter.Err without joining workers.
+// Defer that error until Download has called wg.Wait, so completion journals and
+// file handles are fully settled before task finalization or iterator cleanup.
+type settlingIter struct{ downloader.Iter }
+
+func (i settlingIter) Err() error { return nil }
 
 func (i *iter) processGrouped(ctx context.Context, message *tg.Message, from peers.Peer) (bool, bool) {
 	grouped, err := tutil.GetGroupedMessages(ctx, i.pool.Default(ctx), from.InputPeer(), message)

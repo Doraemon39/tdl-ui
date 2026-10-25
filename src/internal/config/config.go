@@ -72,6 +72,8 @@ type Settings struct {
 	ProxyMode string `json:"proxyMode"`
 	// DownloadDir 默认下载目录
 	DownloadDir string `json:"downloadDir"`
+	// DiskUsageLimit 下载目录所在磁盘的使用率上限（1..99，默认 90）。
+	DiskUsageLimit int `json:"diskUsageLimit"`
 	// Template 默认文件命名模板（Go text/template，与 tdl 兼容）
 	Template string `json:"template"`
 	// ConflictAction 同名文件处理动作：skip=跳过同名文件（默认） / overwrite=覆盖同名文件 / rename=自动重命名
@@ -123,6 +125,7 @@ type yamlConfig struct {
 	Download struct {
 		NamingPolicyVersion int    `yaml:"namingPolicyVersion"`
 		Dir                 string `yaml:"dir"`
+		DiskUsageLimit      int    `yaml:"diskUsageLimit"`
 		Template            string `yaml:"template"`
 		ConflictAction      string `yaml:"conflictAction"`
 		ConflictCheck       string `yaml:"conflictCheck"`
@@ -165,6 +168,7 @@ func settingsToYAML(s Settings) yamlConfig {
 	y.App.ExitAction = s.ExitAction
 	y.Download.NamingPolicyVersion = s.NamingPolicyVersion
 	y.Download.Dir = s.DownloadDir
+	y.Download.DiskUsageLimit = s.DiskUsageLimit
 	y.Download.Template = s.Template
 	y.Download.ConflictAction = s.ConflictAction
 	y.Download.ConflictCheck = s.ConflictCheck
@@ -213,6 +217,7 @@ func yamlToSettings(y yamlConfig) Settings {
 		Proxy:               y.Session.Proxy,
 		ProxyMode:           proxyMode,
 		DownloadDir:         y.Download.Dir,
+		DiskUsageLimit:      y.Download.DiskUsageLimit,
 		Template:            y.Download.Template,
 		ConflictAction:      conflictAction,
 		ConflictCheck:       conflictCheck,
@@ -374,6 +379,7 @@ func defaultSettings(dataDir string) Settings {
 		Proxy:               "",
 		ProxyMode:           ProxyModeSystem,
 		DownloadDir:         downloadDir,
+		DiskUsageLimit:      90,
 		Template:            DefaultTemplate,
 		NamingPolicyVersion: 1,
 		ConflictAction:      "skip",
@@ -832,6 +838,12 @@ func (m *Manager) MarkTemplatesSeeded() error {
 
 // normalizePolicies rejects unknown values before any filesystem mutation.
 func normalizePolicies(s *Settings) error {
+	if s.DiskUsageLimit == 0 {
+		s.DiskUsageLimit = 90
+	}
+	if s.DiskUsageLimit < 1 || s.DiskUsageLimit > 99 {
+		return errors.New("磁盘使用率上限必须在 1% 到 99% 之间")
+	}
 	if s.ConflictAction == "" {
 		s.ConflictAction = "skip"
 	}

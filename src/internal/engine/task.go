@@ -88,6 +88,7 @@ type TaskView struct {
 	ScriptName string   `json:"scriptName"`
 	Status     string   `json:"status"`
 	Error      string   `json:"error,omitempty"`
+	Notice     string   `json:"notice,omitempty"`
 	Total      int      `json:"total"`
 	Finished   int      `json:"finished"`
 	Failed     int      `json:"failed"`
@@ -100,11 +101,13 @@ type TaskView struct {
 
 // Task 一次下载任务。
 type Task struct {
-	fileIndex     map[string]int
-	manifest      *manifest.Session
-	manifestError string
-	ID            string
-	CreatedAt     string
+	manifestMu          sync.Mutex
+	completionManifests map[string]*manifest.Session
+	fileIndex           map[string]int
+	manifest            *manifest.Session
+	manifestError       string
+	ID                  string
+	CreatedAt           string
 
 	opts      TaskOptions
 	contracts *script.Contracts
@@ -165,6 +168,10 @@ func (t *Task) view() TaskView {
 		speed += s
 	}
 	t.speedMu.Unlock()
+	errMsg, notice := t.errMsg, ""
+	if t.status == StatusDone {
+		notice, errMsg = errMsg, ""
+	}
 	return TaskView{
 		ID:         t.ID,
 		URLs:       t.opts.URLs,
@@ -172,7 +179,8 @@ func (t *Task) view() TaskView {
 		Dir:        t.opts.Dir,
 		ScriptName: t.opts.ScriptName,
 		Status:     t.status,
-		Error:      t.errMsg,
+		Error:      errMsg,
+		Notice:     notice,
 		Total:      t.total,
 		Finished:   t.finished,
 		Failed:     t.failed,

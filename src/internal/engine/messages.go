@@ -82,7 +82,7 @@ func resolveMessageLinks(ctx context.Context, manager *peers.Manager, urls []str
 			}
 			valid := false
 			for _, m := range messages {
-				if h, ok := m.ReplyTo.(*tg.MessageReplyHeader); ok && (h.ReplyToTopID == rootID || h.ReplyToMsgID == rootID) {
+				if messageInDiscussion(m, rootID) {
 					valid = true
 				}
 			}
@@ -97,6 +97,17 @@ func resolveMessageLinks(ctx context.Context, manager *peers.Manager, urls []str
 		}
 	}
 	return mergeDialogRanges(out), single, nil
+}
+
+func messageInDiscussion(m *tg.Message, rootID int) bool {
+	if m == nil || rootID <= 0 {
+		return false
+	}
+	if m.ID == rootID {
+		return true
+	}
+	h, ok := m.ReplyTo.(*tg.MessageReplyHeader)
+	return ok && (h.ReplyToTopID == rootID || h.ReplyToMsgID == rootID)
 }
 
 func getPeerMessages(ctx context.Context, api *tg.Client, peer tg.InputPeerClass, ids []int, selfIDs ...int64) ([]*tg.Message, error) {

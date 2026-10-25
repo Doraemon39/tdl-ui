@@ -351,13 +351,14 @@ func NewManagerAt(dataDir string) (*Manager, error) {
 	}
 	dataDir = abs
 	m := &Manager{dataDir: dataDir, settings: defaultSettings(dataDir)}
-	if err := m.loadOrMigrate(); err != nil {
-		return nil, err
-	}
-	if cleaned, err := m.resumeCleanup(); err != nil {
+	loadErr := m.loadOrMigrate()
+	if cleaned, err := m.resumeCleanup(loadErr != nil); err != nil {
 		return nil, errors.Wrap(err, "上次确认的退出清理未完成")
 	} else if cleaned {
 		return NewManagerAt(dataDir)
+	}
+	if loadErr != nil {
+		return nil, loadErr
 	}
 	return m, nil
 }

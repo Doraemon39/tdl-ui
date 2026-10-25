@@ -68,6 +68,12 @@ func (c *thumbCache) Get(kind string, dialogID int64, messageID int, fetch func(
 			<-ch // 等拉取方结束后重读；若其失败则下一轮自己成为拉取方
 			continue
 		}
+		// A writer may have completed after our first read but before we took
+		// the lock. Do not start a second fetch after its inflight entry is gone.
+		if b, err := readCacheFile(p, 32<<20); err == nil {
+			c.mu.Unlock()
+			return b, nil
+		}
 		ch := make(chan struct{})
 		c.inflight[p] = ch
 		e := c.epoch // LOGIC-002：快照清空代际，写盘前校验

@@ -4,5 +4,7 @@ package safeio
 
 import "os"
 
-func reparsePoint(info os.FileInfo) bool { return false }
-func mkdirPrivate(dir string) error      { return os.Mkdir(dir, 0o700) }
+func reparsePoint(path string, info os.FileInfo) bool {
+	return info.Mode()&(os.ModeSymlink|os.ModeIrregular) != 0
+}
+func mkdirPrivate(dir string) error { return os.Mkdir(dir, 0o700) }

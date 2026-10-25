@@ -100,7 +100,13 @@ func (s *DownloadService) ReviewLocalMedia(dir string, dialog int64, typ, title 
 		}
 	}
 	if len(s.reviews) >= 8 {
-		s.reviews = map[string]mediaReview{}
+		oldest := ""
+		for token, r := range s.reviews {
+			if oldest == "" || r.at.Before(s.reviews[oldest].at) {
+				oldest = token
+			}
+		}
+		delete(s.reviews, oldest)
 	}
 	s.reviews[cmp.Token] = mediaReview{owner: owner, dialog: dialog, typ: typ, title: title, dir: dir, entries: entries, comparison: cmp, at: time.Now()}
 	return cmp, nil

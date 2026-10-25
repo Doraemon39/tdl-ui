@@ -7,7 +7,35 @@ import (
 	"tdl-ui/internal/engine"
 	"tdl-ui/internal/manifest"
 	"testing"
+	"time"
 )
+
+func TestReviewCapacityEvictsOnlyOldestUnexpiredResult(t *testing.T) {
+	s, dir, item := manifestFixture(t)
+	s.reviews = make(map[string]mediaReview)
+	for i := 0; i < 8; i++ {
+		token := fmtCoordinate(7, i)
+		s.reviews[token] = mediaReview{owner: 42, at: time.Now().Add(-time.Duration(8-i) * time.Minute)}
+	}
+	latest, err := s.ReviewLocalMedia(dir, 7, "channel", "fixture", []MediaItem{item})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(s.reviews) != 8 {
+		t.Fatalf("capacity insertion discarded reviews: got %d", len(s.reviews))
+	}
+	if _, ok := s.reviews[fmtCoordinate(7, 0)]; ok {
+		t.Fatal("oldest review was not evicted")
+	}
+	for i := 1; i < 8; i++ {
+		if _, ok := s.reviews[fmtCoordinate(7, i)]; !ok {
+			t.Fatalf("unexpired review %d was lost", i)
+		}
+	}
+	if _, ok := s.reviews[latest.Token]; !ok {
+		t.Fatal("new review is missing")
+	}
+}
 
 func manifestFixture(t *testing.T) (*DownloadService, string, MediaItem) {
 	t.Helper()

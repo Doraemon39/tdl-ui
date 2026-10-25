@@ -1,11 +1,35 @@
 # 临时文件目录（项目规范：所有临时文件放置于 tmp/）
 tmp/
+/work/
+.cache/
+*.tmp
+*.temp
 
 # Go 构建产物
 src/build/bin/
 src/.tools/
 *.exe
 *.syso
+*.test
+*.pdb
+
+# Test coverage and performance profiles
+coverage.out
+/coverage/
+/src/coverage/
+/src/frontend/coverage/
+*.prof
+
+# Local runtime databases and SQLite sidecars
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
 
 # 前端依赖与构建产物
 node_modules/

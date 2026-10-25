@@ -213,3 +213,181 @@ func TestSessionLeasesExcludeCredentialReplacement(t *testing.T) {
 	}
 	change()
 }
+
+func TestConfirmedWipeRecoversFromCorruptMetadata(t *testing.T) {
+	for _, runner := range []string{"helper", "startup"} {
+		for _, corrupt := range []string{"config.yaml", "tasks.db"} {
+			t.Run(runner+"/"+corrupt, func(t *testing.T) {
+				m, err := NewManagerAt(t.TempDir())
+				if err != nil {
+					t.Fatal(err)
+				}
+				private := filepath.Join(m.KVDir(), "session")
+				put(t, private)
+				unknown := filepath.Join(m.DataDir(), "keep.txt")
+				put(t, unknown)
+				downloaded := filepath.Join(t.TempDir(), "media.mp4")
+				put(t, downloaded)
+				s := m.Get()
+				s.DownloadDir = filepath.Dir(downloaded)
+				if err := m.Update(s); err != nil {
+					t.Fatal(err)
+				}
+				history := filepath.Join(t.TempDir(), "historical-media.mp4")
+				put(t, history)
+				db, err := store.Open(filepath.Join(m.DataDir(), "tasks.db"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := db.InsertTask(context.Background(), store.Task{ID: "history", Dir: filepath.Dir(history), Status: "done"}, nil); err != nil {
+					db.Close()
+					t.Fatal(err)
+				}
+				if err := db.Close(); err != nil {
+					t.Fatal(err)
+				}
+				if err := m.ScheduleCleanup("wipe_all"); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(m.DataDir(), corrupt), []byte("invalid: [metadata"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				if runner == "helper" {
+					err = RunPendingCleanup(m.DataDir())
+				} else {
+					_, err = NewManagerAt(m.DataDir())
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := os.Stat(private); !os.IsNotExist(err) {
+					t.Fatal("confirmed wipe did not remove session")
+				}
+				assertExists(t, unknown)
+				assertExists(t, downloaded)
+				assertExists(t, history)
+				if HasPendingCleanup(m.DataDir()) {
+					t.Fatal("completed wipe remains pending")
+				}
+			})
+		}
+	}
+}
+
+func TestCorruptDatabaseWithoutConfirmedScopeDoesNotAllowWipe(t *testing.T) {
+	m, err := NewManagerAt(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	private := filepath.Join(m.KVDir(), "session")
+	put(t, private)
+	if err := os.WriteFile(filepath.Join(m.DataDir(), "tasks.db"), []byte("corrupt SQLite"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.ScheduleCleanup("wipe_all"); err == nil {
+		t.Fatal("unverified cleanup scope was accepted")
+	}
+	assertExists(t, private)
+	if HasPendingCleanup(m.DataDir()) {
+		t.Fatal("unsafe cleanup was scheduled")
+	}
+}
+
+func TestCorruptConfigCannotUseLegacyOrOverlappingRecoveryScope(t *testing.T) {
+	for _, kind := range []string{"legacy", "overlapping"} {
+		t.Run(kind, func(t *testing.T) {
+			m, err := NewManagerAt(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			private := filepath.Join(m.KVDir(), "session")
+			put(t, private)
+			if err := m.ScheduleCleanup("wipe_all"); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(m.DataDir(), pendingCleanupName)
+			b, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var plan CleanupSpec
+			if err := json.Unmarshal(b, &plan); err != nil {
+				t.Fatal(err)
+			}
+			if kind == "legacy" {
+				plan.Version = 0
+				plan.ProtectedDirs = nil
+			} else {
+				plan.ProtectedDirs = []string{m.KVDir()}
+			}
+			b, _ = json.Marshal(plan)
+			if err := os.WriteFile(path, b, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(m.configPath(), []byte("bad: ["), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := RunPendingCleanup(m.DataDir()); err == nil {
+				t.Fatal("unsafe recovery scope accepted")
+			}
+			assertExists(t, private)
+		})
+	}
+}
+
+func TestLiveDownloadProtectionStillBlocksCorruptDatabaseRecovery(t *testing.T) {
+	m, err := NewManagerAt(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	private := filepath.Join(m.KVDir(), "keep-media")
+	put(t, private)
+	if err := m.ScheduleCleanup("wipe_all"); err != nil {
+		t.Fatal(err)
+	}
+	s := m.Get()
+	s.DownloadDir = m.KVDir()
+	if err := m.Update(s); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(m.DataDir(), "tasks.db"), []byte("corrupt SQLite"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := RunPendingCleanup(m.DataDir()); err == nil {
+		t.Fatal("saved scope overrode known live download protection")
+	}
+	assertExists(t, private)
+}
+
+func TestCorruptMetadataRecoveryIgnoresSuppliedTargets(t *testing.T) {
+	m, err := NewManagerAt(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(t.TempDir(), "keep")
+	put(t, outside)
+	if err := m.ScheduleCleanup("wipe_all"); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(m.DataDir(), pendingCleanupName)
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var plan CleanupSpec
+	if err := json.Unmarshal(b, &plan); err != nil {
+		t.Fatal(err)
+	}
+	plan.Targets = []string{outside}
+	b, _ = json.Marshal(plan)
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(m.configPath(), []byte("bad: ["), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := RunPendingCleanup(m.DataDir()); err != nil {
+		t.Fatal(err)
+	}
+	assertExists(t, outside)
+}

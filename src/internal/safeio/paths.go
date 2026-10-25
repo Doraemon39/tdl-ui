@@ -65,7 +65,7 @@ func CheckPath(path string) error {
 		if err != nil && !os.IsNotExist(err) {
 			return err
 		}
-		if err == nil && (info.Mode()&(os.ModeSymlink|os.ModeIrregular) != 0 || reparsePoint(info)) {
+		if err == nil && reparsePoint(p, info) {
 			return errors.New("路径包含符号链接或目录联接，拒绝操作")
 		}
 		if filepath.Dir(p) == p {

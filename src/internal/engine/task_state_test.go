@@ -119,6 +119,159 @@ func TestCancelRunningTask(t *testing.T) {
 	waitStatus(t, task, StatusCanceled)
 }
 
+// telegram.Client.Run normalizes context.Canceled to nil. Exercise that
+// boundary instead of assuming every executor propagates cancellation.
+func TestPauseAndCancelSurviveExecutorSwallowingCancellation(t *testing.T) {
+	for _, pause := range []bool{true, false} {
+		name, want := "cancel", StatusCanceled
+		if pause {
+			name, want = "pause", StatusPaused
+		}
+		t.Run(name, func(t *testing.T) {
+			started := make(chan struct{})
+			returned := make(chan struct{})
+			m := newStubManager(func(ctx context.Context, _ *Task) error {
+				close(started)
+				<-ctx.Done()
+				return nil
+			})
+			task := addQueuedTask(m, name)
+			go func() { m.run(task); close(returned) }()
+			<-started
+			var err error
+			if pause {
+				err = m.Pause(task.ID)
+			} else {
+				err = m.Cancel(task.ID)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-returned:
+			case <-time.After(3 * time.Second):
+				t.Fatal("task did not finish after cancellation")
+			}
+			if v := task.view(); v.Status != want {
+				t.Fatalf("cancellation was reported as success: %+v", v)
+			}
+			m.executor = func(context.Context, *Task) error { return nil }
+			if err := m.Resume(task.ID); err != nil {
+				t.Fatalf("task cannot resume: %v", err)
+			}
+			waitStatus(t, task, StatusDone)
+			if err := task.waitFinalization(); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestRunDoesNotHideFileFailuresWhenExecutorReturnsNil(t *testing.T) {
+	m := newStubManager(func(_ context.Context, task *Task) error {
+		task.onFileFailed()
+		return nil
+	})
+	task := addQueuedTask(m, "file-failure")
+	m.run(task)
+	if v := task.view(); v.Status != StatusFailed || v.Failed != 1 || v.Error == "" {
+		t.Fatalf("failed file was reported as success: %+v", v)
+	}
+}
+
+func TestRunDoesNotReportAnInterruptedRangeAsDone(t *testing.T) {
+	m := newStubManager(func(_ context.Context, task *Task) error {
+		task.mu.Lock()
+		task.total, task.finished, task.skipped = 10, 2, 1
+		task.mu.Unlock()
+		return nil
+	})
+	task := addQueuedTask(m, "unfinished-range")
+	m.run(task)
+	if v := task.view(); v.Status != StatusFailed || v.Error == "" {
+		t.Fatalf("unfinished range was reported as success: %+v", v)
+	}
+}
+
+func TestReloadRecoversTasksIncorrectlyMarkedDone(t *testing.T) {
+	for _, tc := range []struct {
+		name                             string
+		total, finished, failed, skipped int
+		notice                           string
+		want                             string
+	}{
+		{"interrupted range", 1631, 720, 0, 446, "", StatusPaused},
+		{"unreported failures", 3, 2, 1, 0, "", StatusFailed},
+		{"completed range", 3, 2, 0, 1, "", StatusDone},
+		{"intentional disk stop", 1631, 720, 0, 446, "磁盘达到使用率上限", StatusDone},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := newMemRepo()
+			repo.tasks["legacy"] = store.Task{ID: "legacy", Status: StatusDone, Total: tc.total, Finished: tc.finished, Failed: tc.failed, Error: tc.notice}
+			for n := range tc.skipped {
+				repo.files["legacy"] = append(repo.files["legacy"], store.File{State: "skipped", MessageID: n + 1})
+			}
+			m := NewManager(Deps{Emitter: &events.Emitter{}, Store: repo})
+			v := m.List()[0]
+			if v.Status != tc.want || v.Finished != tc.finished || v.Skipped != tc.skipped {
+				t.Fatalf("incorrect recovery: %+v", v)
+			}
+			if repo.tasks["legacy"].Status != tc.want {
+				t.Fatal("recovered status was not persisted")
+			}
+			if tc.want == StatusFailed && v.Error == "" {
+				t.Fatal("failed task has no explanation")
+			}
+			if tc.notice != "" && v.Notice != tc.notice {
+				t.Fatal("intentional stop notice was changed")
+			}
+		})
+	}
+}
+
+func TestRecoveredTaskResumesOriginalRangeAndPreservesProgress(t *testing.T) {
+	repo := newMemRepo()
+	repo.tasks["legacy"] = store.Task{ID: "legacy", Status: StatusDone, Total: 3, Finished: 1, DownloadOptions: marshalOutputOptions(TaskOptions{AccountID: 42})}
+	repo.items["legacy"] = []store.Item{{ItemType: store.ItemTypeSelection, DialogID: 20, DialogType: DialogChannel, MessageIDs: []int{1, 2, 3}}}
+	repo.files["legacy"] = []store.File{{State: "done", MessageID: 1, Path: "saved.mp4"}, {State: "skipped", MessageID: 2}}
+	key := resumeKey(20, 1, DialogChannel)
+	repo.finished["legacy"] = map[string]struct{}{key: {}}
+	m := NewManager(Deps{Emitter: &events.Emitter{}, Store: repo})
+	task := m.tasks["legacy"]
+	if task.status != StatusPaused {
+		t.Fatalf("expected recovered pause, got %s", task.status)
+	}
+	executed := make(chan struct{})
+	m.executor = func(_ context.Context, task *Task) error {
+		task.mu.Lock()
+		task.finished++
+		task.mu.Unlock()
+		close(executed)
+		return nil
+	}
+	if err := m.Resume("legacy"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-executed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("recovered task was not restarted")
+	}
+	waitStatus(t, task, StatusDone)
+	if err := task.waitFinalization(); err != nil {
+		t.Fatal(err)
+	}
+	if task.opts.AccountID != 42 || len(task.opts.Selections) != 1 || len(task.opts.Selections[0].MessageIDs) != 3 || task.opts.Selections[0].MessageIDs[2] != 3 {
+		t.Fatal("recovery changed the original account or selection")
+	}
+	if len(repo.files["legacy"]) != 2 || repo.files["legacy"][0].Path != "saved.mp4" {
+		t.Fatal("recovery changed the saved file records")
+	}
+	if _, ok := repo.finished["legacy"][key]; !ok {
+		t.Fatal("recovery discarded the completed-file resume key")
+	}
+}
+
 // 排队态直接 Pause/Cancel（ENG-04）；run 启动时放弃执行。
 func TestQueuedDirectTransitions(t *testing.T) {
 	executed := false

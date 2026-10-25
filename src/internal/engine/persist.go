@@ -98,6 +98,23 @@ func (m *Manager) loadFromStore() {
 				t.skipped++
 			}
 		}
+		// Older clients could swallow cancellation and persist an unfinished
+		// range as done. Keep intentional disk stops (which have a notice), but
+		// expose interrupted ranges for resumption without losing any records.
+		if t.status == StatusDone && t.errMsg == "" {
+			if t.failed > 0 {
+				t.status = StatusFailed
+				t.errMsg = "部分文件未能完成保存，请查看失败记录后重试"
+			} else if t.total > t.finished+t.skipped {
+				t.status = StatusPaused
+			}
+			if t.status != StatusDone {
+				logEngine.Warnf("修复未完成任务的历史状态: id=%s done -> %s", t.ID, t.status)
+				if err := m.deps.Store.UpdateTaskStatus(ctx, t.ID, t.status, t.errMsg); err != nil {
+					logStoreErr(err, "保存恢复后的任务状态失败: id=%s err=%v", t.ID, err)
+				}
+			}
+		}
 		m.tasks[t.ID] = t
 		m.order = append(m.order, t.ID)
 	}

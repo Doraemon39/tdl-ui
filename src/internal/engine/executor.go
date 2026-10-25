@@ -50,17 +50,29 @@ func (m *Manager) run(t *Task) {
 		exec = m.execute
 	}
 	err := exec(ctx, t)
+	t.mu.Lock()
+	// telegram.Client.Run can return nil after context cancellation. Preserve
+	// the user's stop request before canceling this run's context ourselves.
+	if err == nil {
+		err = ctx.Err()
+	}
+	t.cancel = nil
+	manifestError, failed := t.manifestError, t.failed
+	total, completed := t.total, t.finished+t.skipped
+	t.mu.Unlock()
 	cancel()
 	var diskLimit *diskLimitError
-	if errors.As(err, &diskLimit) {
-		t.mu.Lock()
-		manifestError := t.manifestError
-		failed := t.failed
-		t.mu.Unlock()
+	if err == nil || errors.As(err, &diskLimit) {
+		prefix := ""
+		if err != nil {
+			prefix = err.Error() + "\n"
+		}
 		if manifestError != "" {
-			err = errors.New(err.Error() + "\n文件已保存，但清单未能更新：" + manifestError)
+			err = errors.New(prefix + "文件已保存，但清单未能更新：" + manifestError)
 		} else if failed > 0 {
-			err = errors.New(err.Error() + "\n部分文件未能完成保存，请查看失败记录后重试")
+			err = errors.New(prefix + "部分文件未能完成保存，请查看失败记录后重试")
+		} else if err == nil && total > completed {
+			err = errors.New("下载在处理完全部项目之前结束，请重试剩余项目")
 		}
 	}
 	notice := ""
@@ -69,7 +81,6 @@ func (m *Manager) run(t *Task) {
 	}
 
 	t.mu.Lock()
-	t.cancel = nil
 	switch {
 	case notice != "":
 		t.status = StatusDone
